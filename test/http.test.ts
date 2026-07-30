@@ -32,6 +32,8 @@ type Harness = {
   readonly statePath: string;
   readonly log: CapturedLog;
   readonly service: SessionService;
+  /** Moves the service's clock, for the windows reconciliation measures in time. */
+  readonly at: (ms: number) => void;
 };
 
 let sequence = 0;
@@ -43,6 +45,7 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
   const adapter = fakeAdapter();
   const statePath = stateFilePath(config);
   const log = capturingLogger();
+  let current = 1_764_000_000_000;
   const service = createSessionService({
     adapter,
     config,
@@ -52,7 +55,7 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
     },
     host: 'test-host',
     logger: log.logger,
-    now: () => 1_764_000_000_000,
+    now: () => current,
     store: createStateStore(statePath),
   });
   return {
@@ -63,6 +66,9 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
       logger: log.logger,
       port: config.port,
     }),
+    at: (ms) => {
+      current = ms;
+    },
     config,
     log,
     service,
@@ -346,8 +352,10 @@ describe('session lifecycle', () => {
       const harnessed = await harness(dir);
       await postSession(harnessed, { repo: 'example' });
 
-      // Something outside ccrcd killed the tmux session.
+      // Something outside ccrcd killed the tmux session, and the launch window the
+      // record is granted has long since passed.
       harnessed.adapter.liveNames = [];
+      harnessed.at(1_764_000_600_000);
 
       const listing = (await (await harnessed.app.request('/sessions')).json()) as {
         sessions: Record<string, unknown>[];

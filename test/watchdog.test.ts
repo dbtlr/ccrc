@@ -87,9 +87,20 @@ const byId = (records: readonly SessionRecord[], id: string): SessionRecord | un
 describe('reboot reconciliation', () => {
   test('retires every record whose tmux session is gone, and relaunches nothing', async () => {
     await withTempDir(async (dir) => {
+      // Records a reboot left behind: written before the machine went down.
       const harnessed = await harness(dir, [
-        sessionRecord({ id: 'id1', status: 'running', tmuxName: 'ccrc-example-1' }),
-        sessionRecord({ id: 'id2', status: 'starting', tmuxName: 'ccrc-example-2' }),
+        sessionRecord({
+          id: 'id1',
+          startedAt: NOW - 60 * MINUTE,
+          status: 'running',
+          tmuxName: 'ccrc-example-1',
+        }),
+        sessionRecord({
+          id: 'id2',
+          startedAt: NOW - 60 * MINUTE,
+          status: 'starting',
+          tmuxName: 'ccrc-example-2',
+        }),
       ]);
       // An empty tmux server is what a rebooted host looks like.
       harnessed.adapter.liveNames = [];
@@ -102,6 +113,52 @@ describe('reboot reconciliation', () => {
       expect(stored.map((record) => record.endedAt)).toEqual([NOW, NOW]);
       expect(stored[0]?.stopReason).toBe('its tmux session was gone');
       expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('never retires a session that launched while the liveness snapshot was in flight', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      // Reconciliation reads liveness first and the host fleet second. Hold it in
+      // that gap — the tmux snapshot it is carrying cannot know about a launch that
+      // has not happened yet.
+      const gate = Promise.withResolvers<void>();
+      harnessed.adapter.listDelay = () => gate.promise;
+      const reconciling = harnessed.service.reconcile();
+      await Bun.sleep(1);
+      harnessed.adapter.listDelay = () => Promise.resolve();
+
+      const launched = await harnessed.service.launch({ repo: 'example' });
+      gate.resolve();
+      await reconciling;
+
+      expect(launched.status).toBe('running');
+      const stored = await harnessed.store.load();
+      expect(stored[0]?.status).toBe('running');
+      expect(stored[0]?.endedAt).toBeNull();
+      expect(stored[0]?.stopReason).toBeNull();
+    });
+  });
+
+  test('waits out the launch window before retiring a record tmux has never listed', async () => {
+    await withTempDir(async (dir) => {
+      // Written seconds ago: tmux may simply not have the session yet.
+      const harnessed = await harness(dir, [
+        sessionRecord({ id: 'id1', startedAt: NOW - 10_000, status: 'starting' }),
+      ]);
+      harnessed.adapter.liveNames = [];
+
+      await harnessed.service.reconcile();
+      expect((await harnessed.store.load())[0]?.status).toBe('starting');
+
+      // Past the window, the same answer is a real one.
+      harnessed.at(NOW + 2 * MINUTE);
+      await harnessed.service.reconcile();
+
+      const stored = await harnessed.store.load();
+      expect(stored[0]?.status).toBe('stopped');
+      expect(stored[0]?.endedAt).toBe(NOW + 2 * MINUTE);
     });
   });
 

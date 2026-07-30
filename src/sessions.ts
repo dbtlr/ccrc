@@ -186,15 +186,39 @@ const correlate = (
   return candidates.length === 1 ? candidates[0] : undefined;
 };
 
+/** What tmux was live at a known moment. The moment is the point. */
+export type LivenessSnapshot = {
+  readonly names: ReadonlySet<string>;
+  readonly takenAt: number;
+};
+
+/**
+ * How long a record is exempt from retirement after it is created.
+ *
+ * A record is written before tmux is asked for the session, and the attach URL then
+ * has up to 60s to appear, so a liveness snapshot taken anywhere in that window
+ * legitimately does not list the session yet. Retiring a record on that answer stops
+ * a session that is coming up perfectly well — and marks it `stopped` while it keeps
+ * running with `bypassPermissions`, which is the worst of both. The next tick retires
+ * it truthfully if it really is gone.
+ */
+const LAUNCH_GRACE_MS = 90_000;
+
 /**
  * tmux session gone while the record still claims to be active → stopped. This is
  * also the whole of ccrcd's reboot story: a rebooted host has an empty tmux server,
  * so the first reconciliation retires every record it left behind. Nothing is ever
  * relaunched from that — a machine coming back up must not start running
  * `bypassPermissions` sessions on its own.
+ *
+ * The snapshot is compared against the record's age, not against the clock: a
+ * snapshot only speaks for the moment it was taken, and reconciliation's own host
+ * listing can hold it for as long as the `claude` CLI takes to answer.
  */
-const stopIfGone = (record: SessionRecord, live: ReadonlySet<string>, at: number): SessionRecord =>
-  ACTIVE_STATUSES.has(record.status) && !live.has(record.tmuxName)
+const stopIfGone = (record: SessionRecord, live: LivenessSnapshot, at: number): SessionRecord =>
+  ACTIVE_STATUSES.has(record.status) &&
+  !live.names.has(record.tmuxName) &&
+  record.startedAt + LAUNCH_GRACE_MS <= live.takenAt
     ? {
         ...record,
         endedAt: at,
@@ -233,9 +257,12 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
    * sessions are still running, so the listing is served unreconciled instead and
    * the reason is logged for the operator.
    */
-  const liveNamesOrUnknown = async (): Promise<ReadonlySet<string> | undefined> => {
+  const liveNamesOrUnknown = async (): Promise<LivenessSnapshot | undefined> => {
     try {
-      return new Set(await adapter.liveSessionNames());
+      const names = new Set(await adapter.liveSessionNames());
+      // Timed on return, not on use: what follows may hold this answer for as long
+      // as the claude CLI takes, and a launch can land in that gap.
+      return { names, takenAt: now() };
     } catch (cause) {
       logger.error(
         `ccrcd could not read live tmux sessions, so records were left as they are: ${messageOf(cause)}`,
