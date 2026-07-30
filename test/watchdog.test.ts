@@ -6,7 +6,7 @@ import type { HostSession } from '../src/adapter/claude.ts';
 import { loadConfig, stateFilePath } from '../src/config.ts';
 import { StopError } from '../src/errors.ts';
 import { LAUNCH_GRACE_MS, createSessionService } from '../src/sessions.ts';
-import type { HangOutcome, SessionService } from '../src/sessions.ts';
+import type { HangOutcome, SessionService, SessionView } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
 import type { SessionRecord, StateStore } from '../src/state.ts';
 import {
@@ -117,30 +117,48 @@ describe('reboot reconciliation', () => {
     });
   });
 
-  test('never retires a session that launched while the liveness snapshot was in flight', async () => {
-    await withTempDir(async (dir) => {
-      const harnessed = await harness(dir);
+  /**
+   * Reconciliation reads liveness first and the host fleet second, so a launch can
+   * land in that gap. The clock moves while it does — freezing it in a test hides the
+   * whole question, since `startedAt === takenAt` sits on the boundary of every
+   * comparison — so each of these moves it by a real offset.
+   */
+  const launchDuringSnapshot = async (
+    harnessed: Harness,
+    offsetMs: number,
+  ): Promise<SessionView> => {
+    const gate = Promise.withResolvers<void>();
+    harnessed.adapter.listDelay = () => gate.promise;
+    const reconciling = harnessed.service.reconcile();
+    // Lets the liveness snapshot resolve and be timestamped before the clock moves.
+    await Bun.sleep(1);
+    harnessed.adapter.listDelay = () => Promise.resolve();
 
-      // Reconciliation reads liveness first and the host fleet second. Hold it in
-      // that gap — the tmux snapshot it is carrying cannot know about a launch that
-      // has not happened yet.
-      const gate = Promise.withResolvers<void>();
-      harnessed.adapter.listDelay = () => gate.promise;
-      const reconciling = harnessed.service.reconcile();
-      await Bun.sleep(1);
-      harnessed.adapter.listDelay = () => Promise.resolve();
+    harnessed.at(NOW + offsetMs);
+    const launched = await harnessed.service.launch({ repo: 'example' });
+    gate.resolve();
+    await reconciling;
+    return launched;
+  };
 
-      const launched = await harnessed.service.launch({ repo: 'example' });
-      gate.resolve();
-      await reconciling;
+  test.each([1, 250, 2_000, 30_000])(
+    'never retires a session created %sms after the liveness snapshot',
+    async (offsetMs) => {
+      await withTempDir(async (dir) => {
+        const harnessed = await harness(dir);
 
-      expect(launched.status).toBe('running');
-      const stored = await harnessed.store.load();
-      expect(stored[0]?.status).toBe('running');
-      expect(stored[0]?.endedAt).toBeNull();
-      expect(stored[0]?.stopReason).toBeNull();
-    });
-  });
+        const launched = await launchDuringSnapshot(harnessed, offsetMs);
+
+        // The snapshot predates the record: it is the strongest possible reason it
+        // cannot speak about it, and this session is running with bypassPermissions.
+        expect(launched.status).toBe('running');
+        const stored = await harnessed.store.load();
+        expect(stored[0]?.status).toBe('running');
+        expect(stored[0]?.endedAt).toBeNull();
+        expect(stored[0]?.stopReason).toBeNull();
+      });
+    },
+  );
 
   test('waits out the launch window before retiring a record tmux has never listed', async () => {
     await withTempDir(async (dir) => {
@@ -243,18 +261,20 @@ describe('reboot reconciliation', () => {
     });
   });
 
-  test('retires a record whose start is ahead of the snapshot after a clock step back', async () => {
+  test('retires a record stamped further ahead than any launch could explain', async () => {
     await withTempDir(async (dir) => {
-      // A clock corrected backwards leaves records stamped in the future. The launch
-      // grace cannot apply to a record that has not started yet by the snapshot's
-      // reckoning, and treating it as forever-young makes it immortal: never retired,
-      // never promoted, and never pruned because it is not terminal.
+      // A clock corrected backwards leaves records stamped in the future. Being ahead
+      // of the snapshot by *more than a whole launch window* cannot be a launch race —
+      // those are milliseconds to seconds — and treating it as forever-young makes the
+      // record immortal: never retired, never promoted, and never pruned because it is
+      // not terminal.
+      const ahead = LAUNCH_GRACE_MS + 10 * MINUTE;
       const harnessed = await harness(dir, [
-        sessionRecord({ id: 'id1', startedAt: NOW + 10 * MINUTE, status: 'running' }),
+        sessionRecord({ id: 'id1', startedAt: NOW + ahead, status: 'running' }),
         sessionRecord({
           attachUrl: null,
           id: 'id2',
-          startedAt: NOW + 10 * MINUTE,
+          startedAt: NOW + ahead,
           status: 'starting',
           tmuxName: 'ccrc-example-2',
         }),

@@ -230,14 +230,21 @@ export const LAUNCH_GRACE_MS = WORST_CASE_LAUNCH_MS + 30_000;
 /**
  * Whether a snapshot is entitled to speak about this record.
  *
- * It is not while the record is inside its launch window. It is once that window has
- * passed — and also when the record claims to have started *after* the snapshot was
- * taken, which happens when the clock steps backwards: a grace period measured from a
- * future timestamp would never expire, leaving a record that is never retired, never
- * promoted, and never pruned because it is not terminal.
+ * It is not while the record is anywhere inside its launch window — including when the
+ * snapshot was taken *before* the record even existed, which is the strongest reason of
+ * all: reconciliation's own host listing can hold a snapshot for as long as the
+ * `claude` CLI takes to answer, and a launch landing in that gap is milliseconds to
+ * seconds newer than it.
+ *
+ * The one thing that cannot be a launch race is a record stamped further ahead than a
+ * whole launch window, which is what a clock corrected backwards leaves behind. That is
+ * judged by magnitude, and only there, because a grace period measured from a future
+ * timestamp would otherwise never expire: the record would never be retired, never
+ * promoted, and never pruned, since it is not terminal.
  */
 const launchWindowPassed = (record: SessionRecord, live: LivenessSnapshot): boolean =>
-  record.startedAt > live.takenAt || record.startedAt + LAUNCH_GRACE_MS <= live.takenAt;
+  record.startedAt - live.takenAt > LAUNCH_GRACE_MS ||
+  record.startedAt + LAUNCH_GRACE_MS <= live.takenAt;
 
 /**
  * tmux session gone while the record still claims to be active → stopped. This is
