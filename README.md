@@ -172,7 +172,6 @@ A session record looks like:
   "name": "example-1",
   "host": "workstation",
   "repoName": "example",
-  "repoPath": "/Users/me/code/example",
   "tmuxName": "ccrc-example-1",
   "rcName": "ccrc-k7m2p4qd",
   "attachUrl": "https://claude.ai/code/session_01JQ4Z8YB0",
@@ -182,6 +181,9 @@ A session record looks like:
   "activity": "idle"
 }
 ```
+
+The repo's configured path stays on the host — same as `GET /repos` — so it is never part
+of a session record either.
 
 `status` is ccrcd's own view of the tmux session (`starting`, `running`, `stopped`,
 `failed`). `activity` is the session's own busy/idle report from `claude agents --json`, or

@@ -149,10 +149,11 @@ describe('session lifecycle', () => {
         pid: 4242,
         rcName: 'ccrc-id1',
         repoName: 'example',
-        repoPath: '/repos/example',
         status: 'running',
         tmuxName: 'ccrc-example-1',
       });
+      // The configured path stays on the host, same as the registry it came from.
+      expect(session.repoPath).toBeUndefined();
       expect(harnessed.adapter.launches[0]).toEqual({
         prompt: '/plan',
         rcName: 'ccrc-id1',
@@ -167,6 +168,7 @@ describe('session lifecycle', () => {
       };
       expect(listing.sessions.length).toBe(1);
       expect(listing.sessions[0]).toMatchObject({ id: 'id1', status: 'running' });
+      expect(listing.sessions[0]?.repoPath).toBeUndefined();
       // The whole host fleet rides along, ccrcd-launched or not.
       expect(listing.hostSessions.length).toBe(2);
 
@@ -176,9 +178,9 @@ describe('session lifecycle', () => {
 
       const deleted = await harnessed.app.request('/sessions/id1', { method: 'DELETE' });
       expect(deleted.status).toBe(200);
-      expect((await deleted.json()) as Record<string, unknown>).toMatchObject({
-        status: 'stopped',
-      });
+      const stoppedBody = (await deleted.json()) as Record<string, unknown>;
+      expect(stoppedBody).toMatchObject({ status: 'stopped' });
+      expect(stoppedBody.repoPath).toBeUndefined();
       expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
 
       const afterStop = await harnessed.app.request('/sessions/id1');
