@@ -107,6 +107,17 @@ const FIRST_POLL_INTERVAL_MS = 150;
 const DEFAULT_URL_TIMEOUT_MS = 60_000;
 /** Long enough for a slow tmux or claude start, short enough to fail a request. */
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+
+/**
+ * The longest a launch can take before it gives up: the tmux spawn is bounded by the
+ * command timeout, the attach URL by its own deadline, and the poll that finds the
+ * deadline passed by the command timeout again.
+ *
+ * Exported because reconciliation has to know how long a record may legitimately have
+ * no tmux session yet. Derived rather than restated, so the two cannot drift apart.
+ */
+export const WORST_CASE_LAUNCH_MS =
+  DEFAULT_COMMAND_TIMEOUT_MS + DEFAULT_URL_TIMEOUT_MS + DEFAULT_COMMAND_TIMEOUT_MS;
 const MISSING_SESSION_PATTERN = /can't find session|no such session|no server running/i;
 
 export const defaultClaudeConfigPath = (home: string = homedir()): string =>

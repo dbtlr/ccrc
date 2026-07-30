@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 
+import { WORST_CASE_LAUNCH_MS } from '../src/adapter/claude.ts';
 import type { HostSession } from '../src/adapter/claude.ts';
 import { loadConfig, stateFilePath } from '../src/config.ts';
 import { StopError } from '../src/errors.ts';
-import { createSessionService } from '../src/sessions.ts';
+import { LAUNCH_GRACE_MS, createSessionService } from '../src/sessions.ts';
 import type { HangOutcome, SessionService } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
 import type { SessionRecord, StateStore } from '../src/state.ts';
@@ -153,13 +154,20 @@ describe('reboot reconciliation', () => {
       expect((await harnessed.store.load())[0]?.status).toBe('starting');
 
       // Past the window, the same answer is a real one.
-      harnessed.at(NOW + 2 * MINUTE);
+      const past = NOW + LAUNCH_GRACE_MS + MINUTE;
+      harnessed.at(past);
       await harnessed.service.reconcile();
 
       const stored = await harnessed.store.load();
       expect(stored[0]?.status).toBe('stopped');
-      expect(stored[0]?.endedAt).toBe(NOW + 2 * MINUTE);
+      expect(stored[0]?.endedAt).toBe(past);
     });
+  });
+
+  test('grants records longer than a launch can possibly take', () => {
+    // The grace exists to cover a launch in progress, so it has to outlast one — the
+    // two are derived from the same numbers rather than picked separately.
+    expect(LAUNCH_GRACE_MS).toBeGreaterThan(WORST_CASE_LAUNCH_MS);
   });
 
   test('promotes a starting record whose tmux session outlived the launch', async () => {
@@ -232,6 +240,34 @@ describe('reboot reconciliation', () => {
       // Without correlation the live session reports no activity and the watchdog can
       // never see it at all — for as long as retention keeps the dead record.
       expect(listing.sessions.find((session) => session.id === 'id2')?.activity).toBe('idle');
+    });
+  });
+
+  test('retires a record whose start is ahead of the snapshot after a clock step back', async () => {
+    await withTempDir(async (dir) => {
+      // A clock corrected backwards leaves records stamped in the future. The launch
+      // grace cannot apply to a record that has not started yet by the snapshot's
+      // reckoning, and treating it as forever-young makes it immortal: never retired,
+      // never promoted, and never pruned because it is not terminal.
+      const harnessed = await harness(dir, [
+        sessionRecord({ id: 'id1', startedAt: NOW + 10 * MINUTE, status: 'running' }),
+        sessionRecord({
+          attachUrl: null,
+          id: 'id2',
+          startedAt: NOW + 10 * MINUTE,
+          status: 'starting',
+          tmuxName: 'ccrc-example-2',
+        }),
+      ]);
+      harnessed.adapter.liveNames = ['ccrc-example-2'];
+
+      await harnessed.service.reconcile();
+
+      const stored = await harnessed.store.load();
+      expect(byId(stored, 'id1')?.status).toBe('stopped');
+      expect(byId(stored, 'id1')?.endedAt).toBe(NOW);
+      // The same reasoning promotes the one tmux does still have.
+      expect(byId(stored, 'id2')?.status).toBe('running');
     });
   });
 

@@ -1,5 +1,6 @@
 import { hostname } from 'node:os';
 
+import { WORST_CASE_LAUNCH_MS } from './adapter/claude.ts';
 import type { ClaudeAdapter, HostSession, SessionActivity } from './adapter/claude.ts';
 import { findRepo } from './config.ts';
 import type { Config, RepoEntry } from './config.ts';
@@ -215,13 +216,28 @@ export type LivenessSnapshot = {
  * How long a record is exempt from retirement after it is created.
  *
  * A record is written before tmux is asked for the session, and the attach URL then
- * has up to 60s to appear, so a liveness snapshot taken anywhere in that window
- * legitimately does not list the session yet. Retiring a record on that answer stops
- * a session that is coming up perfectly well — and marks it `stopped` while it keeps
+ * has its own deadline to appear, so a liveness snapshot taken anywhere in that window
+ * legitimately does not list the session yet. Retiring a record on that answer stops a
+ * session that is coming up perfectly well — and marks it `stopped` while it keeps
  * running with `bypassPermissions`, which is the worst of both. The next tick retires
  * it truthfully if it really is gone.
+ *
+ * Derived from the launch's own timeouts plus a margin rather than picked: the two have
+ * to move together, and the adapter owns those numbers.
  */
-const LAUNCH_GRACE_MS = 90_000;
+export const LAUNCH_GRACE_MS = WORST_CASE_LAUNCH_MS + 30_000;
+
+/**
+ * Whether a snapshot is entitled to speak about this record.
+ *
+ * It is not while the record is inside its launch window. It is once that window has
+ * passed — and also when the record claims to have started *after* the snapshot was
+ * taken, which happens when the clock steps backwards: a grace period measured from a
+ * future timestamp would never expire, leaving a record that is never retired, never
+ * promoted, and never pruned because it is not terminal.
+ */
+const launchWindowPassed = (record: SessionRecord, live: LivenessSnapshot): boolean =>
+  record.startedAt > live.takenAt || record.startedAt + LAUNCH_GRACE_MS <= live.takenAt;
 
 /**
  * tmux session gone while the record still claims to be active → stopped. This is
@@ -237,7 +253,7 @@ const LAUNCH_GRACE_MS = 90_000;
 const stopIfGone = (record: SessionRecord, live: LivenessSnapshot, at: number): SessionRecord =>
   ACTIVE_STATUSES.has(record.status) &&
   !live.names.has(record.tmuxName) &&
-  record.startedAt + LAUNCH_GRACE_MS <= live.takenAt
+  launchWindowPassed(record, live)
     ? {
         ...record,
         endedAt: at,
@@ -260,7 +276,7 @@ const stopIfGone = (record: SessionRecord, live: LivenessSnapshot, at: number): 
 const promoteIfStranded = (record: SessionRecord, live: LivenessSnapshot): SessionRecord =>
   record.status === 'starting' &&
   live.names.has(record.tmuxName) &&
-  record.startedAt + LAUNCH_GRACE_MS <= live.takenAt
+  launchWindowPassed(record, live)
     ? { ...record, status: 'running' }
     : record;
 
