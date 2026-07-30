@@ -328,6 +328,35 @@ describe('workspace creation', () => {
     });
   });
 
+  test('refuses a created directory that did not land inside the root', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      const removed: string[] = [];
+      // What a symlink racing into place under the root would look like: the mkdir
+      // succeeds, and the real path it resolves to is somewhere else entirely.
+      const elsewhere: WorkspaceAdapter = {
+        ...harnessed.adapter,
+        createDirectory: () => Promise.resolve(join(dir, 'outside', 'escaped')),
+        removeIfPristine: (path) => {
+          removed.push(path);
+          return Promise.resolve(true);
+        },
+      };
+      const service = createWorkspaceService({
+        adapter: elsewhere,
+        config: harnessed.config,
+        logger: harnessed.log.logger,
+      });
+
+      const failure = await rejection(service.create('escaped'));
+
+      expect(failure).toBeInstanceOf(BadRequestError);
+      expect(failure.message).toMatch(/inside the workspaces root/);
+      expect(removed).toEqual([join(dir, 'outside', 'escaped')]);
+      expect(harnessed.gitCalls()).toEqual([]);
+    });
+  });
+
   test('removes the directory it made when git cannot initialise it', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, { git: 'init-fails' });

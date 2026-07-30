@@ -232,6 +232,23 @@ describe('workspace creation', () => {
     });
   });
 
+  test.each(['../etc', 'scanned/../../etc', '.hidden', 'absent'])(
+    'refuses to launch the unlisted name %p',
+    async (repo) => {
+      await withTempDir(async (dir) => {
+        const root = join(dir, 'workspaces');
+        await mkdir(join(root, 'scanned'), { recursive: true });
+        await mkdir(join(root, '.hidden'), { recursive: true });
+        const harnessed = await harness(dir, withWorkspaces(root));
+
+        const response = await postSession(harnessed, { repo });
+
+        expect(response.status).toBe(404);
+        expect(harnessed.adapter.launches).toEqual([]);
+      });
+    },
+  );
+
   test('answers 404 when no workspaces root is configured', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
