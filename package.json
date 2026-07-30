@@ -1,0 +1,28 @@
+{
+  "name": "ccrcd",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Thin session-launcher daemon for Claude Code — starts, lists, and stops remote-controllable sessions on a host.",
+  "license": "MIT",
+  "bin": {
+    "ccrcd": "./src/main.ts"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "start": "bun src/main.ts",
+    "check": "vp check",
+    "test": "bun test",
+    "verify": "bun run check && bun run test"
+  },
+  "dependencies": {
+    "hono": "4.10.7"
+  },
+  "devDependencies": {
+    "@dbtlr/tooling": "0.3.0",
+    "@types/bun": "latest",
+    "oxlint": "1.70.0",
+    "vite": "^8.1.4",
+    "vite-plus": "^0.2.1"
+  }
+}

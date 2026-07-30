@@ -1,2 +1,7 @@
 .atlas.toml
 .claude/settings.local.json
+
+node_modules/
+dist/
+*.log
+.DS_Store
