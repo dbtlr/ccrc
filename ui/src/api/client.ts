@@ -45,13 +45,19 @@ const asStatus = (value: unknown): SessionStatus =>
 const asActivity = (value: unknown): SessionActivity =>
   value === 'idle' || value === 'busy' ? value : 'unknown';
 
+/** The only URL this ever renders into an `href`, so it is checked, not just typed. */
+const ATTACH_URL_PREFIX = 'https://claude.ai/code/';
+
+const asAttachUrl = (value: unknown): string | null =>
+  typeof value === 'string' && value.startsWith(ATTACH_URL_PREFIX) ? value : null;
+
 const toSession = (value: unknown): Session | null => {
   if (!isRecord(value) || typeof value.id !== 'string') {
     return null;
   }
   return {
     activity: asActivity(value.activity),
-    attachUrl: typeof value.attachUrl === 'string' ? value.attachUrl : null,
+    attachUrl: asAttachUrl(value.attachUrl),
     host: asString(value.host, 'this host'),
     id: value.id,
     name: asString(value.name, value.id),
