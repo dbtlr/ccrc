@@ -43,7 +43,7 @@ export const Board = (): JSX.Element => {
   return (
     <div className="space-y-10">
       {showing === undefined ? null : (
-        <Notice label="ccrcd refused" message={showing} onDismiss={dismiss} />
+        <Notice label="error" message={showing} onDismiss={dismiss} />
       )}
       <DispatchForm launching={launch.isPending} onLaunch={startLaunch} />
       <SessionRack onStop={startStop} stoppingId={stop.isPending ? stop.variables : undefined} />

@@ -73,7 +73,7 @@ export const SessionStrip = ({
               </>
             )}
           </Ledger>
-          <p className="font-mono text-micro text-faint mt-1.5">
+          <p className="mt-1.5 font-mono text-micro leading-4 text-faint">
             {live ? (
               <>
                 up {elapsed(session.startedAt, now)}
@@ -98,8 +98,10 @@ export const SessionStrip = ({
               </Button>
             </div>
           </div>
-        ) : (
-          <div className="mt-3.5 flex gap-2">
+        ) : null}
+
+        {confirming || !(session.attachUrl !== null || live) ? null : (
+          <div className="mt-3.5 flex items-center gap-2">
             {session.attachUrl === null ? null : (
               <Button asChild className="flex-1" variant="outline">
                 <a href={session.attachUrl} rel="noreferrer" target="_blank">
@@ -119,12 +121,7 @@ export const SessionStrip = ({
               </Button>
             )}
             {live ? (
-              <Button
-                className={session.attachUrl === null ? 'flex-1' : undefined}
-                disabled={stopping}
-                onClick={askToStop}
-                variant="ghost"
-              >
+              <Button className="ml-auto" disabled={stopping} onClick={askToStop} variant="ghost">
                 {stopping ? 'Stopping…' : 'Stop'}
               </Button>
             ) : null}

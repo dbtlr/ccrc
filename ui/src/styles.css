@@ -36,15 +36,15 @@
     --sunken: #e3e7e9;
     --ink: #0f1419;
     --ink-muted: #59636e;
-    --ink-faint: #8b949d;
+    --ink-faint: #6e7883;
     --hairline: color-mix(in oklab, #0f1419 12%, transparent);
     --edge: color-mix(in oklab, #0f1419 26%, transparent);
 
     --tone-starting: #46689a;
     --tone-idle: #2c7461;
     --tone-busy: #8f5c0e;
-    --tone-running: #4a5560;
-    --tone-stopped: #78828c;
+    --tone-running: #3f4a56;
+    --tone-stopped: #6b747d;
     --tone-failed: #a33a33;
   }
 
@@ -55,15 +55,15 @@
       --sunken: #070a0e;
       --ink: #e3e8ec;
       --ink-muted: #949ea8;
-      --ink-faint: #656f79;
+      --ink-faint: #848e98;
       --hairline: color-mix(in oklab, #e3e8ec 13%, transparent);
       --edge: color-mix(in oklab, #e3e8ec 30%, transparent);
 
       --tone-starting: #82a7d6;
       --tone-idle: #58b498;
       --tone-busy: #d8a441;
-      --tone-running: #97a3ae;
-      --tone-stopped: #7b858f;
+      --tone-running: #b8c2cc;
+      --tone-stopped: #838d97;
       --tone-failed: #e2695f;
     }
   }
@@ -133,27 +133,24 @@
   [data-state='stopped'] {
     --signal: var(--tone-stopped);
   }
-  [data-state='failed'],
-  [data-state='unknown'] {
+  [data-state='failed'] {
     --signal: var(--tone-failed);
   }
-  [data-state='unknown'] {
-    --signal: var(--tone-stopped);
-  }
 
-  /* The rack: one hairline running the length of the board, with each strip's
-     rail clipped onto it. */
   .rack {
     position: relative;
   }
 
+  /* The channel the rails are clipped onto: it shows through the gap between
+     strips, so the leading edge of the board reads as one continuous run. */
   .rack::before {
     content: '';
     position: absolute;
-    inset-block: 0.5rem;
-    left: 1px;
-    width: 1px;
-    background: var(--hairline);
+    inset-block: 0;
+    left: 0;
+    width: 3px;
+    border-radius: 2px;
+    background: var(--edge);
   }
 
   /* A working session breathes; nothing else on the board moves. */

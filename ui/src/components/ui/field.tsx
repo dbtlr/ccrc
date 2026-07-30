@@ -51,7 +51,7 @@ export const Select = ({ className, ...props }: ComponentProps<'select'>): JSX.E
 
 export const Textarea = ({ className, ...props }: ComponentProps<'textarea'>): JSX.Element => (
   <textarea
-    className={cn(CONTROL, 'min-h-28 resize-y py-3 text-body leading-relaxed', className)}
+    className={cn(CONTROL, 'min-h-28 resize-y py-3 font-mono text-body leading-relaxed', className)}
     {...props}
   />
 );

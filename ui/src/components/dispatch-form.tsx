@@ -75,11 +75,7 @@ export const DispatchForm = ({ launching, onLaunch }: DispatchFormProps): JSX.El
             </Select>
           </Field>
 
-          <Field
-            hint="Optional. Slash commands work here — the session runs it as its first turn."
-            htmlFor="prompt"
-            label="First message"
-          >
+          <Field hint="Optional. Slash commands work here." htmlFor="prompt" label="First message">
             <Textarea
               id="prompt"
               name="prompt"

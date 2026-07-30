@@ -21,7 +21,7 @@ export const elapsed = (fromMs: number, nowMs: number): string => {
   return `${Math.floor(total / DAY_MS)}d ${Math.floor((total % DAY_MS) / HOUR_MS)}h`;
 };
 
-const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
 const DATE_FORMAT = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
 
 /** Clock time, with the date added only once it stops being today's. */
