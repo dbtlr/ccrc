@@ -169,9 +169,10 @@ runs every `reconcile_interval_seconds`, plus once at startup, and does three th
    whole of the reboot story: a rebooted host has an empty tmux server, so the startup tick
    retires everything left over. Nothing is ever relaunched on boot — a host coming back up
    must not start `bypassPermissions` sessions on its own. Two things keep this honest: a
-   record is exempt from retirement for 90 seconds after it is created, because a liveness
-   snapshot taken during a launch legitimately does not list the session yet; and a
-   `starting` record past that window whose tmux session _is_ live is promoted to `running`,
+   record is exempt from retirement for as long as a launch could still be running (the
+   launch timeouts plus a margin), because a liveness snapshot taken during a launch
+   legitimately does not list the session yet; and a `starting` record past that window
+   whose tmux session _is_ live is promoted to `running`,
    which is what a daemon killed mid-launch leaves behind (its `attachUrl` stays `null` —
    the URL is printed once into the pane and was never captured).
 2. **Watch for hangs.** A session is hung only when two signals agree: it reports itself
@@ -308,7 +309,11 @@ to end it (its tmux session was gone, a launch failed, the watchdog found it hun
 `null` for an operator's own `DELETE`. `restartedFrom` and `restartedAs` cross-link a hung
 session to the one that replaced it, in both directions and even when the replacement's own
 launch failed. `pid` and `hostSessionId` are how a record claims its entry in the host
-fleet, which is what stops a replacement from adopting the killed session's entry;
+fleet, which is what stops the next session in a repo from adopting a killed session's
+entry — the CLI lists a killed session for a while, and an adopted entry would hand a
+healthy session a stranger's activity and a stranger's stale transcript. Every kill claims
+it, an operator's `DELETE` included. The claim expires with the session: a record that has
+ended only claims entries that started before it did, so a pid the OS later reuses is free.
 `restarts` is the automatic-restart history the cap is counted from.
 
 The repo's configured path stays on the host — same as `GET /repos` — so it is never part
