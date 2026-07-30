@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   chmod,
   lstat,
+  mkdir,
   readdir,
   readFile,
   realpath,
@@ -11,8 +12,18 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { createBunCommandRunner, createClaudeAdapter } from '../src/adapter/claude.ts';
-import { CommandTimeoutError, LaunchError, LivenessError, StopError } from '../src/errors.ts';
+import {
+  createBunCommandRunner,
+  createClaudeAdapter,
+  transcriptSlug,
+} from '../src/adapter/claude.ts';
+import {
+  CommandTimeoutError,
+  HealthError,
+  LaunchError,
+  LivenessError,
+  StopError,
+} from '../src/errors.ts';
 import {
   failed,
   fakeClock,
@@ -681,5 +692,106 @@ describe('stop and liveness', () => {
 
     expect(failure).toBeInstanceOf(LivenessError);
     expect(failure.message).toMatch(/Permission denied/);
+  });
+});
+
+const withTranscript = async (
+  sessionId: string,
+  run: (projectsDir: string, transcriptPath: string) => Promise<void>,
+): Promise<void> =>
+  withTempDir(async (dir) => {
+    const projectDir = join(dir, transcriptSlug('/repos/example'));
+    await mkdir(projectDir, { recursive: true });
+    const transcriptPath = join(projectDir, `${sessionId}.jsonl`);
+    await writeFile(transcriptPath, '{"type":"user"}\n');
+    await run(dir, transcriptPath);
+  });
+
+describe('transcript liveness', () => {
+  test('reads the mtime of the transcript the session appends to', async () => {
+    const sessionId = '1f57afb6-fd76-4f06-97c9-f27c84a211d9';
+    await withTranscript(sessionId, async (projectsDir, transcriptPath) => {
+      const adapter = createClaudeAdapter({
+        projectsDir,
+        run: recordingRunner(() => ok()).run,
+      });
+
+      const mtime = await adapter.transcriptMtime({ cwd: '/repos/example', sessionId });
+
+      expect(mtime).toBe((await stat(transcriptPath)).mtimeMs);
+    });
+  });
+
+  test('names the project directory the way the CLI does', () => {
+    expect(transcriptSlug('/repos/example')).toBe('-repos-example');
+    expect(transcriptSlug('/home/tester/code/app/.worktrees/topic_1')).toBe(
+      '-home-tester-code-app--worktrees-topic-1',
+    );
+  });
+
+  test('a transcript that is not there is indeterminate, never stale', async () => {
+    await withTempDir(async (projectsDir) => {
+      const adapter = createClaudeAdapter({
+        projectsDir,
+        run: recordingRunner(() => ok()).run,
+      });
+
+      expect(
+        await adapter.transcriptMtime({ cwd: '/repos/example', sessionId: 'absent' }),
+      ).toBeNull();
+    });
+  });
+
+  test.each(['../../../etc/passwd', 'a/b', '..', 'has space', ''])(
+    'refuses the session id %p rather than probing outside the projects directory',
+    async (sessionId) => {
+      await withTempDir(async (projectsDir) => {
+        const adapter = createClaudeAdapter({
+          projectsDir,
+          run: recordingRunner(() => ok()).run,
+        });
+
+        expect(await adapter.transcriptMtime({ cwd: '/repos/example', sessionId })).toBeNull();
+      });
+    },
+  );
+});
+
+describe('health probes', () => {
+  test('tmux answering at all is healthy, with or without a running server', async () => {
+    const listed = createClaudeAdapter({ run: recordingRunner(() => ok('ccrc-example-1\n')).run });
+    const noServer = createClaudeAdapter({
+      run: recordingRunner(() => failed('no server running')).run,
+    });
+
+    expect(await listed.checkTmux()).toBeUndefined();
+    expect(await noServer.checkTmux()).toBeUndefined();
+  });
+
+  test('a tmux that will not answer fails the probe', async () => {
+    const unreachable = createClaudeAdapter({
+      run: recordingRunner(() => failed('error connecting to /tmp/tmux-501/default')).run,
+    });
+
+    expect(await rejection(unreachable.checkTmux())).toBeInstanceOf(LivenessError);
+  });
+
+  test('the claude probe asks the CLI for its version', async () => {
+    const recording = recordingRunner(() => ok('2.0.0\n'));
+
+    await createClaudeAdapter({ run: recording.run }).checkClaude();
+
+    expect(recording.calls).toEqual([['claude', '--version']]);
+  });
+
+  test('a claude CLI that does not answer fails the probe', async () => {
+    const missing = createClaudeAdapter({
+      run: recordingRunner(() => failed('command not found: claude', 127)).run,
+    });
+
+    const failure = await rejection(missing.checkClaude());
+
+    expect(failure).toBeInstanceOf(HealthError);
+    expect(failure.message).toMatch(/command not found/);
   });
 });

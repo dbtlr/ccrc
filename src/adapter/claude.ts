@@ -1,8 +1,14 @@
-import { readFile, realpath } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { CommandTimeoutError, LaunchError, LivenessError, StopError } from '../errors.ts';
+import {
+  CommandTimeoutError,
+  HealthError,
+  LaunchError,
+  LivenessError,
+  StopError,
+} from '../errors.ts';
 import { writeFileAtomic } from '../files.ts';
 import { createMutex } from '../mutex.ts';
 
@@ -47,6 +53,12 @@ export type LaunchRequest = {
 /** Whether a kill landed or found nothing to kill; any other failure throws. */
 export type StopOutcome = 'stopped' | 'absent';
 
+/** Enough to find the transcript a running session is appending to. */
+export type TranscriptRef = {
+  readonly cwd: string;
+  readonly sessionId: string;
+};
+
 export type ClaudeAdapter = {
   /** Accept the trust dialog for `repoPath` up front; returns the resolved path. */
   readonly trustRepo: (repoPath: string) => Promise<string>;
@@ -61,12 +73,24 @@ export type ClaudeAdapter = {
    * for an empty one.
    */
   readonly liveSessionNames: () => Promise<readonly string[]>;
+  /**
+   * When the session last wrote to its transcript, in epoch milliseconds, or
+   * `null` when that cannot be established. A session claiming to be busy while
+   * its transcript stands still is the second liveness signal ccrcd has, so
+   * `null` has to stay indeterminate: it may never be read as "stale".
+   */
+  readonly transcriptMtime: (ref: TranscriptRef) => Promise<number | null>;
+  /** Resolves when tmux answers; throws when it cannot be reached. */
+  readonly checkTmux: () => Promise<void>;
+  /** Resolves when the claude CLI answers; throws when it cannot be reached. */
+  readonly checkClaude: () => Promise<void>;
 };
 
 export type AdapterOptions = {
   readonly run?: CommandRunner;
   readonly commandTimeoutMs?: number;
   readonly claudeConfigPath?: string;
+  readonly projectsDir?: string;
   readonly resolvePath?: (path: string) => Promise<string>;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly now?: () => number;
@@ -87,6 +111,24 @@ const MISSING_SESSION_PATTERN = /can't find session|no such session|no server ru
 
 export const defaultClaudeConfigPath = (home: string = homedir()): string =>
   join(home, '.claude.json');
+
+export const defaultProjectsDir = (home: string = homedir()): string =>
+  join(home, '.claude', 'projects');
+
+/**
+ * claude files a session's transcript under a directory named after the session's
+ * cwd with every character outside `[A-Za-z0-9]` replaced by a dash — so
+ * `/repos/example` becomes `-repos-example`. Nothing publishes that scheme, which
+ * is exactly why it lives in this module with the rest of the CLI's internals.
+ */
+export const transcriptSlug = (cwd: string): string => cwd.replaceAll(/[^a-zA-Z0-9]/g, '-');
+
+/**
+ * The id is CLI output, so it is treated as untrusted input: a value carrying a
+ * separator or a dot segment would resolve outside the projects directory, and
+ * `stat` on an operator's arbitrary file is not a liveness signal.
+ */
+const SESSION_ID_PATTERN = /^[\w-]+$/;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -301,6 +343,7 @@ const tailOf = (text: string, lines = 3): string =>
 export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter => {
   const run = options.run ?? createBunCommandRunner(options.commandTimeoutMs);
   const claudeConfigPath = options.claudeConfigPath ?? defaultClaudeConfigPath();
+  const projectsDir = options.projectsDir ?? defaultProjectsDir();
   const resolvePath = options.resolvePath ?? ((path: string) => realpath(path));
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? Bun.sleep;
@@ -444,6 +487,40 @@ export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter
     return parsed.map(toHostSession).filter((session): session is HostSession => session !== null);
   };
 
+  /**
+   * A transcript that cannot be found or read is reported as `null` rather than as
+   * an ancient mtime: the only caller kills sessions on the strength of staleness,
+   * and a renamed CLI directory layout must not make it kill every session on the
+   * host.
+   */
+  const transcriptMtime = async (ref: TranscriptRef): Promise<number | null> => {
+    if (!SESSION_ID_PATTERN.test(ref.sessionId)) {
+      return null;
+    }
+    try {
+      const stats = await stat(
+        join(projectsDir, transcriptSlug(ref.cwd), `${ref.sessionId}.jsonl`),
+      );
+      return stats.mtimeMs;
+    } catch {
+      return null;
+    }
+  };
+
+  /** Liveness for the health endpoint: tmux with no server running still answers. */
+  const checkTmux = async (): Promise<void> => {
+    await liveSessionNames();
+  };
+
+  const checkClaude = async (): Promise<void> => {
+    const result = await run(['claude', '--version']);
+    if (result.exitCode !== 0) {
+      throw new HealthError(
+        `the claude CLI did not answer: ${result.stderr.trim() || `exit code ${result.exitCode}`}`,
+      );
+    }
+  };
+
   const trustRepo = async (repoPath: string): Promise<string> => {
     const resolved = await resolvePath(repoPath);
     await writeTrust(claudeConfigPath, resolved);
@@ -451,10 +528,13 @@ export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter
   };
 
   return {
+    checkClaude,
+    checkTmux,
     launchSession,
     listHostSessions,
     liveSessionNames,
     stopSession,
+    transcriptMtime,
     trustRepo,
   };
 };

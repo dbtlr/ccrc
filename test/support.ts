@@ -107,6 +107,13 @@ export type FakeAdapter = ClaudeAdapter & {
   trustFailure: Error | null;
   /** Set when tmux cannot be asked which sessions are live. */
   liveFailure: Error | null;
+  /** Transcript mtimes by session id; an id with no entry reads as indeterminate. */
+  transcripts: Record<string, number>;
+  /** Set when the transcript path itself cannot be probed. */
+  transcriptFailure: Error | null;
+  /** Set when the health probe for that dependency should fail. */
+  tmuxHealthFailure: Error | null;
+  claudeHealthFailure: Error | null;
   /** Awaited before every `listHostSessions`, to interleave requests on purpose. */
   listDelay: () => Promise<void>;
   /** Awaited before every `stopSession`, to interleave requests on purpose. */
@@ -132,6 +139,15 @@ export const fakeAdapter = (): FakeAdapter => {
   const stopped: string[] = [];
   const adapter: FakeAdapter = {
     attachUrl: 'https://claude.ai/code/session_abc123',
+    checkClaude: () =>
+      adapter.claudeHealthFailure === null
+        ? Promise.resolve()
+        : Promise.reject(adapter.claudeHealthFailure),
+    checkTmux: () =>
+      adapter.tmuxHealthFailure === null
+        ? Promise.resolve()
+        : Promise.reject(adapter.tmuxHealthFailure),
+    claudeHealthFailure: null,
     hostSessions: [],
     // tmux comes up before the attach URL is polled for, so a launch that fails
     // still leaves a session behind — the case the service has to clean up after.
@@ -166,6 +182,13 @@ export const fakeAdapter = (): FakeAdapter => {
       return adapter.stopOutcome;
     },
     stopped,
+    tmuxHealthFailure: null,
+    transcriptFailure: null,
+    transcriptMtime: (ref) =>
+      adapter.transcriptFailure === null
+        ? Promise.resolve(adapter.transcripts[ref.sessionId] ?? null)
+        : Promise.reject(adapter.transcriptFailure),
+    transcripts: {},
     trustFailure: null,
     trustRepo: (repoPath) =>
       adapter.trustFailure === null
