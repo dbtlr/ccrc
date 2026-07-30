@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 import { loadConfig, stateFilePath } from '../src/config.ts';
 import { createApp } from '../src/http/app.ts';
+import { createUiServer } from '../src/http/ui.ts';
 import { createSessionService } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
 import { fakeAdapter, withTempDir } from './support.ts';
@@ -161,21 +162,34 @@ describe('serving the console', () => {
     });
   });
 
-  test.each([
-    '/../secret.txt',
-    '/assets/../../secret.txt',
-    '/%2e%2e/secret.txt',
-    '/..%2f..%2fsecret.txt',
-  ])('refuses to serve %s from outside the build', async (path) => {
-    await withTempDir(async (dir) => {
-      const { app } = await withBuiltUi(dir, 'present');
+  /**
+   * These go through `createUiServer` directly rather than `app.request`. The
+   * fetch/URL layer underneath `app.request` collapses literal `..` and decodes
+   * `%2e` before Hono ever sees the path, and `isApiPath` in `app.ts` (a separate,
+   * already-covered guard) claims every path carrying a raw `%2f`/`%5c` as an API
+   * path before the not-found handler would reach `ui.serve` — so no payload routed
+   * through the full app can ever exercise `withinBuild`'s own containment check.
+   * Calling the UI server directly is the only way to test that check at all.
+   */
+  test.each(['/..%2fsecret.txt', '/%2e%2e%2fsecret.txt', '/assets%2f..%2fsecret.txt'])(
+    'withinBuild refuses to serve %s from outside the build',
+    async (path) => {
+      await withTempDir(async (dir) => {
+        const { uiDir } = await withBuiltUi(dir, 'present');
+        const ui = createUiServer(uiDir);
 
-      const response = await app.request(path);
-      const body = await response.text();
+        const response = await ui.serve(path);
 
-      expect(body).not.toContain('not part of the build');
-    });
-  });
+        // A refusal falls back to the SPA shell, not to serving (or 404ing on) the
+        // secret file, so both the status and the content-type have to match the
+        // shell exactly — a guardless server that simply missed the file by path
+        // arithmetic would still satisfy a body-only assertion.
+        expect(response.status).toBe(200);
+        expect(response.headers.get('content-type')).toContain('text/html');
+        expect(await response.text()).toContain('id="board"');
+      });
+    },
+  );
 
   test('explains an unbuilt console instead of crashing on it', async () => {
     await withTempDir(async (dir) => {
