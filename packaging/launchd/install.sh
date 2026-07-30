@@ -15,6 +15,19 @@ plist="${agents_dir}/${label}.plist"
 log_dir="${HOME}/Library/Logs/ccrc"
 config="${CCRC_CONFIG:-${HOME}/.config/ccrc/config.toml}"
 
+# The agent resolves CCRC_CONFIG on its own, from launchd's working directory — a
+# relative path that happens to work here would restart-loop there. Pin it down now.
+case "${config}" in
+/*) ;;
+*)
+  if [ ! -f "${config}" ]; then
+    echo "no ccrcd config at ${config} (relative to $(pwd)); create it (or set CCRC_CONFIG) first" >&2
+    exit 1
+  fi
+  config="$(cd "$(dirname "${config}")" && pwd -P)/$(basename "${config}")"
+  ;;
+esac
+
 bun="$(command -v bun || true)"
 if [ -z "${bun}" ]; then
   echo "bun is not on PATH; install it first: https://bun.sh" >&2

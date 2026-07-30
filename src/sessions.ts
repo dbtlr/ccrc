@@ -276,7 +276,7 @@ const isGone = (record: SessionRecord, live: LivenessSnapshot): boolean =>
  * it started keeps running with `bypassPermissions`. The record is corrected to what
  * tmux says rather than left immortal. The attach URL stays null: it is printed once
  * into the pane and was never captured, and a record saying "running, URL unknown" is
- * the truth. (A record whose tmux session is gone is retired by `stopIfGone` first.)
+ * the truth. (A record whose tmux session is gone is retired by `retireGone` first.)
  */
 const promoteIfStranded = (record: SessionRecord, live: LivenessSnapshot): SessionRecord =>
   record.status === 'starting' &&

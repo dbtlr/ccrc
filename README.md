@@ -64,7 +64,7 @@ path = "~/notes"
 Only repos in this registry can be launched; `POST /sessions` takes a registry `name`, never
 a path.
 
-### Supervision
+### Supervision settings
 
 The daemon keeps its own house in order on a timer. Every key below is optional and shown
 with its default:
@@ -82,12 +82,12 @@ Every duration is a whole number of its own unit inside a range that keeps the l
 and `restart_cap` is a whole number of 0 or more; anything else is a fatal startup error
 rather than a setting that silently misbehaves.
 
-| Key                          | Range                                            | Why the ends matter                                                                                                        |
-| ---------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `reconcile_interval_seconds` | 5–3600                                           | Under a few seconds ticks pile onto each other; past 2^31-1 ms a timer wraps and fires continuously.                       |
-| `hang_threshold_minutes`     | 1–1440                                           | A fraction of a minute would call every busy session hung on the next tick.                                                |
-| `restart_cap_window_minutes` | 1–10080, and at least `hang_threshold_minutes`   | A window shorter than the threshold could never hold two restarts of one session.                                          |
-| `stopped_retention_days`     | 1–365, and at least `restart_cap_window_minutes` | Restart history lives on records; retention that expires inside the window would drop the history the cap is counted from. |
+| Key                          | Range                                                                                                                                         | Why the ends matter                                                                                                        |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `reconcile_interval_seconds` | 5–3600                                                                                                                                        | Under a few seconds ticks pile onto each other; past 2^31-1 ms a timer wraps and fires continuously.                       |
+| `hang_threshold_minutes`     | 1–1440                                                                                                                                        | A fraction of a minute would call every busy session hung on the next tick.                                                |
+| `restart_cap_window_minutes` | 1–10080, and at least `hang_threshold_minutes`                                                                                                | A window shorter than the threshold could never hold two restarts of one session.                                          |
+| `stopped_retention_days`     | 1–365, and at least `restart_cap_window_minutes` expressed in days (`ceil(minutes / 1440)`, so the default 60-minute window needs just 1 day) | Restart history lives on records; retention that expires inside the window would drop the history the cap is counted from. |
 
 ### Behind a reverse proxy
 
