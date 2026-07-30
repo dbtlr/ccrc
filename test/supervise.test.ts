@@ -144,6 +144,49 @@ describe('supervision loop', () => {
     supervisor.stop();
   });
 
+  test('escalates once ticks keep being skipped, and calms down when one lands', async () => {
+    const stub = stubService();
+    const ticker = fakeTicker();
+    const blocked = Promise.withResolvers<SessionListing>();
+    stub.reconcile = () => blocked.promise;
+    const log = capturingLogger();
+
+    const supervisor = startSupervisor({
+      intervalMs: 30_000,
+      logger: log.logger,
+      service: stub.service,
+      ticker: ticker.ticker,
+    });
+    // The startup tick is wedged inside reconcile, so every interval is a skip. A
+    // few are ordinary; a run of them means supervision has silently stopped.
+    ticker.fire();
+    ticker.fire();
+    ticker.fire();
+    expect(log.errors).toEqual([]);
+    ticker.fire();
+    await supervisor.tick();
+
+    expect(log.errors.join('')).toMatch(/skipped 4 supervision ticks in a row/);
+    expect(log.errors.join('')).toMatch(/skipped 5 supervision ticks in a row/);
+
+    blocked.resolve(EMPTY_LISTING);
+    await supervisor.started;
+    log.errors.length = 0;
+    log.info.length = 0;
+
+    // The wedge cleared: the count starts over rather than staying escalated.
+    const pruned = Promise.withResolvers<void>();
+    stub.reconcile = () => Promise.resolve(EMPTY_LISTING);
+    stub.prune = () => {
+      pruned.resolve();
+      return Promise.resolve(0);
+    };
+    ticker.fire();
+    await pruned.promise;
+    expect(log.errors).toEqual([]);
+    supervisor.stop();
+  });
+
   test('a failing phase neither skips the others nor stops the loop', async () => {
     const stub = stubService();
     const ticker = fakeTicker();

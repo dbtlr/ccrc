@@ -39,6 +39,9 @@ export type Supervisor = {
   readonly stop: () => void;
 };
 
+/** Consecutive dropped ticks that count as ordinary before the log gets loud. */
+const SKIPS_BEFORE_ALARM = 3;
+
 export type SuperviseOptions = {
   readonly service: SessionService;
   readonly intervalMs: number;
@@ -51,6 +54,7 @@ export const startSupervisor = (options: SuperviseOptions): Supervisor => {
   const logger = options.logger ?? createLogger();
   const ticker = options.ticker ?? defaultTicker;
   let running = false;
+  let skipped = 0;
 
   const phase = async (name: string, run: () => Promise<unknown>): Promise<void> => {
     try {
@@ -62,10 +66,28 @@ export const startSupervisor = (options: SuperviseOptions): Supervisor => {
 
   const tick = async (): Promise<void> => {
     if (running) {
-      logger.info('ccrcd skipped a supervision tick because the previous one is still running');
+      skipped += 1;
+      /**
+       * The odd skip is ordinary — a tick that ran long. A run of them is not: it
+       * means a tick is wedged on something that never returns, and nothing is being
+       * reconciled, watched, or pruned while that lasts. Dropped ticks are the only
+       * symptom, so past a few in a row they stop being an aside.
+       */
+      const line =
+        skipped === 1
+          ? 'ccrcd skipped a supervision tick because the previous one is still running'
+          : `ccrcd skipped ${skipped} supervision ticks in a row because one is still running`;
+      if (skipped > SKIPS_BEFORE_ALARM) {
+        logger.error(
+          `${line}; nothing is being reconciled, watched for hangs, or pruned until it returns`,
+        );
+      } else {
+        logger.info(line);
+      }
       return;
     }
     running = true;
+    skipped = 0;
     try {
       await phase('reconcile records against tmux', () => service.reconcile());
       await phase('check for hung sessions', () => service.sweepHung());
