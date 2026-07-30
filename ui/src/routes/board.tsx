@@ -19,20 +19,25 @@ export const Board = (): JSX.Element => {
   const stop = useStop();
   const [dismissed, setDismissed] = useState('');
 
+  // A mutation keeps its error until its own next `mutate()` or a `reset()` —
+  // clearing the *other* one here is what stops a dismissed launch failure from
+  // outliving it and masking a fresh stop failure (or the reverse).
   const startLaunch = useCallback(
     (input: LaunchRequest) => {
       setDismissed('');
+      stop.reset();
       launch.mutate(input);
     },
-    [launch],
+    [launch, stop],
   );
 
   const startStop = useCallback(
     (id: string) => {
       setDismissed('');
+      launch.reset();
       stop.mutate(id);
     },
-    [stop],
+    [launch, stop],
   );
 
   const failure =
