@@ -9,6 +9,22 @@ steering the session is Anthropic Remote Control's job (`https://claude.ai/code/
 Every call into the `claude` CLI, tmux, and `~/.claude.json` is confined to a single
 adapter module (`src/adapter/claude.ts`), so CLI drift is a one-file fix.
 
+## Before you run it
+
+Two facts decide where this daemon may listen:
+
+- **Sessions run with `--permission-mode bypassPermissions`.** A launched session executes
+  whatever it decides to execute inside the target repo, unattended and unprompted.
+- **The API has no authentication.** Anyone who can reach the port can launch a session.
+
+Together those make `POST /sessions` arbitrary code execution, so the bind is restricted to
+loopback: a `bind` outside `127.0.0.0/8`, `::1`, or `localhost` is a fatal startup error.
+Mutating requests (`POST`, `DELETE`) additionally have to look like they came from a local
+client rather than from a web page the operator happened to visit — `content-type:
+application/json` is required (`415` otherwise), and a cross-origin `Origin` or a cross-site
+`Sec-Fetch-Site` is refused (`403`). Reaching the API from elsewhere means putting an
+authenticated transport in front of it.
+
 ## Requirements
 
 - [Bun](https://bun.sh)
@@ -21,7 +37,7 @@ TOML at `~/.config/ccrc/config.toml`, or wherever `CCRC_CONFIG` points. Session 
 persisted to `state.json` in the same directory. A missing config is a fatal startup error.
 
 ```toml
-bind = "127.0.0.1"   # optional, defaults to 127.0.0.1
+bind = "127.0.0.1"   # optional, defaults to 127.0.0.1; must be loopback
 port = 7433          # optional, defaults to 7433
 
 [[repos]]
@@ -93,8 +109,10 @@ A session record looks like:
 fleet — including sessions ccrcd did not launch.
 
 Launching pre-accepts the repo's trust dialog and then polls the new tmux pane for the
-attach URL; if the URL never appears the launch fails loudly and the tmux session is killed
-rather than left behind.
+attach URL. The URL has 60 seconds to appear; a launch that times out, a pane that exits
+first, and a kill tmux refuses on `DELETE` all answer `502` and leave the record honest (a
+timed-out launch kills its tmux session rather than orphaning it). A prompt is capped at
+32 KiB and may not contain NUL bytes.
 
 ## Development
 
