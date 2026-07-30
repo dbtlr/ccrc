@@ -2,6 +2,7 @@
 import { createClaudeAdapter } from './adapter/claude.ts';
 import { loadConfig, stateFilePath } from './config.ts';
 import { messageOf } from './errors.ts';
+import { HEALTH_TIMEOUT_MS, createHealthService } from './health.ts';
 import { createApp } from './http/app.ts';
 import { defaultUiDir } from './http/ui.ts';
 import { createLogger } from './log.ts';
@@ -13,16 +14,27 @@ const logger = createLogger();
 
 const start = async (): Promise<void> => {
   const config = await loadConfig();
+  const statePath = stateFilePath(config);
   const service = createSessionService({
     adapter: createClaudeAdapter(),
     config,
     logger,
-    store: createStateStore(stateFilePath(config)),
+    store: createStateStore(statePath),
+  });
+
+  // Health gets its own adapter with the short command timeout: the probe is raced
+  // against the same deadline either way, but this is what kills the spawned
+  // command at 2s instead of leaving it to the 30s a request's commands are given.
+  const health = createHealthService({
+    adapter: createClaudeAdapter({ commandTimeoutMs: HEALTH_TIMEOUT_MS }),
+    logger,
+    statePath,
   });
 
   const server = Bun.serve({
     fetch: createApp(service, {
       allowedOrigins: config.allowedOrigins,
+      health,
       logger,
       port: config.port,
       uiDir: Bun.env.CCRC_UI_DIR ?? defaultUiDir(),

@@ -8,6 +8,7 @@ import {
   UnsupportedMediaTypeError,
   messageOf,
 } from '../errors.ts';
+import type { HealthService } from '../health.ts';
 import { createLogger } from '../log.ts';
 import type { Logger } from '../log.ts';
 import type { LaunchInput, SessionService } from '../sessions.ts';
@@ -175,6 +176,11 @@ export type AppOptions = {
   /** Where the built console lives. Omitted, the app is the JSON API alone. */
   readonly uiDir?: string | undefined;
   readonly logger?: Logger;
+  /**
+   * The dependency probes `/healthz` reports on. Omitted, the endpoint answers for
+   * the process alone — which is all an app wired without one can honestly claim.
+   */
+  readonly health?: HealthService;
 };
 
 /** Wires the JSON API onto a session service. Nothing here knows about tmux. */
@@ -210,7 +216,18 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
     return next();
   });
 
-  app.get('/healthz', (context) => context.json({ ok: true }));
+  /**
+   * A read, so it stays outside the origin and content-type gates the mutations are
+   * held to — a monitor is a plain `GET` client with no headers to offer.
+   */
+  app.get('/healthz', async (context) => {
+    const { health } = options;
+    if (health === undefined) {
+      return context.json({ checks: {}, ok: true });
+    }
+    const report = await health.check();
+    return report.ok ? context.json(report) : context.json(report, 503);
+  });
 
   // The console cannot read the TOML, so the registry it picks from comes from here.
   app.get('/repos', (context) => context.json({ repos: service.listRepos() }));
