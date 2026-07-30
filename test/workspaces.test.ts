@@ -73,7 +73,10 @@ describe('workspace scan', () => {
       await mkdir(join(harnessed.root, 'alpha'));
       await mkdir(join(harnessed.root, '.hidden'));
       await writeFile(join(harnessed.root, 'notes.txt'), 'not a workspace\n');
-      // A link is how a directory outside the root would become launchable.
+      // A link to a real directory outside the root — the case that matters, since a
+      // link to nothing is excluded whether or not symlinks are followed. Launching
+      // this would run bypassPermissions somewhere the operator never exposed.
+      await mkdir(join(dir, 'elsewhere'));
       await symlink(join(dir, 'elsewhere'), join(harnessed.root, 'linked'));
 
       const registry = createRepoRegistry({
