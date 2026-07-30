@@ -103,6 +103,70 @@ describe('loadConfig', () => {
     },
   );
 
+  test('defaults allowed_origins to nothing at all', async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, 'config.toml');
+      await Bun.write(configPath, SAMPLE);
+
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.allowedOrigins).toEqual([]);
+    });
+  });
+
+  test.each([
+    'https://ccrc.example',
+    'http://ccrc.example',
+    'https://ccrc.example:8443',
+    'http://127.0.0.1:7433',
+  ])('accepts the exact origin %s', async (origin) => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, 'config.toml');
+      await Bun.write(configPath, `allowed_origins = ["${origin}"]\n`);
+
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.allowedOrigins).toEqual([origin]);
+    });
+  });
+
+  test.each([
+    'https://ccrc.example/',
+    'https://ccrc.example/console',
+    'https://ccrc.example?x=1',
+    'https://ccrc.example#top',
+    'https://user@ccrc.example',
+    'https://CCRC.example',
+    'https://ccrc.example:443',
+    'ccrc.example',
+    '*',
+    'https://*.ccrc.example',
+    'file:///tmp',
+    'null',
+    '',
+  ])('refuses the unusable origin %p', async (origin) => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, 'config.toml');
+      await Bun.write(configPath, `allowed_origins = ["${origin}"]\n`);
+
+      const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+      expect(failure).toBeInstanceOf(ConfigError);
+      expect(failure.message).toContain('allowed_origins[0]');
+    });
+  });
+
+  test('refuses allowed_origins that is not a list', async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, 'config.toml');
+      await Bun.write(configPath, 'allowed_origins = "https://ccrc.example"\n');
+
+      const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+      expect(failure.message).toMatch(/"allowed_origins" must be a list/);
+    });
+  });
+
   test('falls back to the XDG-style path when CCRC_CONFIG is unset', () => {
     expect(configPathFrom({}, '/home/tester')).toBe('/home/tester/.config/ccrc/config.toml');
   });

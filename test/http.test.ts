@@ -12,6 +12,7 @@ import type { FakeAdapter } from './support.ts';
 
 const CONFIG_TOML = `bind = "127.0.0.1"
 port = 7433
+allowed_origins = ["https://ccrc.example", "http://ccrc.example:8443"]
 
 [[repos]]
 name = "example"
@@ -31,9 +32,9 @@ type Harness = {
 
 let sequence = 0;
 
-const harness = async (dir: string): Promise<Harness> => {
+const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<Harness> => {
   const configPath = join(dir, 'config.toml');
-  await Bun.write(configPath, CONFIG_TOML);
+  await Bun.write(configPath, configToml);
   const config = await loadConfig({ CCRC_CONFIG: configPath }, join(dir, 'home'));
   const adapter = fakeAdapter();
   const statePath = stateFilePath(config);
@@ -48,7 +49,12 @@ const harness = async (dir: string): Promise<Harness> => {
     now: () => 1_764_000_000_000,
     store: createStateStore(statePath),
   });
-  return { adapter, app: createApp(service), config, statePath };
+  return {
+    adapter,
+    app: createApp(service, { allowedOrigins: config.allowedOrigins }),
+    config,
+    statePath,
+  };
 };
 
 const postSession = async (harnessed: Harness, body: unknown): Promise<Response> =>
@@ -507,6 +513,96 @@ describe('cross-origin defence', () => {
 
       expect(harnessed.adapter.launches).toEqual([]);
       expect(harnessed.adapter.stopped).toEqual([]);
+    });
+  });
+
+  test('a configured origin may drive a mutation', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const launched = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin: 'https://ccrc.example',
+        'sec-fetch-site': 'same-origin',
+      });
+      expect(launched.status).toBe(201);
+
+      const deleted = await harnessed.app.request('/sessions/id1', {
+        headers: { origin: 'http://ccrc.example:8443' },
+        method: 'DELETE',
+      });
+      expect(deleted.status).toBe(200);
+    });
+  });
+
+  // The allow-list is exact strings, so every way of nearly being one is a stranger.
+  test.each([
+    'http://ccrc.example',
+    'https://ccrc.example:8443',
+    'https://ccrc.example.evil',
+    'https://evil.ccrc.example',
+    'https://ccrc.exampl',
+    'https://ccrc.example/',
+    'https://ccrc.example/sessions',
+    'HTTPS://CCRC.EXAMPLE',
+    'null',
+  ])('the near-miss origin %s is still a 403', async (origin) => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin,
+      });
+
+      expect(response.status).toBe(403);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('an empty allow-list refuses a foreign origin outright', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(
+        dir,
+        'bind = "127.0.0.1"\n\n[[repos]]\nname = "example"\npath = "/repos/example"\n',
+      );
+      expect(harnessed.config.allowedOrigins).toEqual([]);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin: 'https://ccrc.example',
+      });
+
+      expect(response.status).toBe(403);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('a configured origin does not excuse a cross-site request', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin: 'https://ccrc.example',
+        'sec-fetch-site': 'cross-site',
+      });
+
+      expect(response.status).toBe(403);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('a configured origin still has to declare a JSON body', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'text/plain',
+        origin: 'https://ccrc.example',
+      });
+
+      expect(response.status).toBe(415);
     });
   });
 

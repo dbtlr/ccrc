@@ -15,7 +15,7 @@ const start = async (): Promise<void> => {
   });
 
   const server = Bun.serve({
-    fetch: createApp(service).fetch,
+    fetch: createApp(service, { allowedOrigins: config.allowedOrigins }).fetch,
     hostname: config.bind,
     port: config.port,
   });

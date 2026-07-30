@@ -14,6 +14,8 @@ export type Config = {
   readonly stateDir: string;
   readonly bind: string;
   readonly port: number;
+  /** Exact origins a browser may drive mutations from, beyond the daemon's own. */
+  readonly allowedOrigins: readonly string[];
   readonly repos: readonly RepoEntry[];
 };
 
@@ -102,6 +104,60 @@ const readBind = (value: unknown): string => {
   return value;
 };
 
+const ORIGIN_SCHEMES = new Set(['http:', 'https:']);
+
+/**
+ * The daemon is loopback-bound and fronted by a reverse proxy, so a browser
+ * loading the proxy's host sends that host as `Origin` and would fail the
+ * same-origin check on every mutation. This list is how the operator names the
+ * proxy — and it stays a list of exact origins.
+ *
+ * Nothing here matches loosely: an entry has to round-trip through `URL.origin`
+ * unchanged, which rejects a trailing slash, a path, a query, a fragment,
+ * userinfo, a redundant default port, and any host casing that would otherwise
+ * compare unequal against the header a browser actually sends. A default-empty
+ * list leaves the guard exactly as strict as it is without one.
+ */
+const readOrigin = (value: unknown, at: string): string => {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new ConfigError(`${at} must be a non-empty string`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new ConfigError(
+      `${at}: "${value}" is not an origin. Use an exact scheme-and-host origin such as "https://ccrc.example".`,
+    );
+  }
+  if (!ORIGIN_SCHEMES.has(parsed.protocol)) {
+    throw new ConfigError(`${at}: "${value}" must use the http or https scheme`);
+  }
+  // `*` survives URL parsing, so a wildcard has to be refused by name rather than
+  // silently accepted as a hostname no browser will ever send.
+  if (parsed.hostname.includes('*')) {
+    throw new ConfigError(
+      `${at}: "${value}" looks like a wildcard. Origins are matched exactly; list each one.`,
+    );
+  }
+  if (parsed.origin !== value) {
+    throw new ConfigError(
+      `${at}: "${value}" must be an exact origin with no trailing slash, path, query, or fragment — did you mean "${parsed.origin}"?`,
+    );
+  }
+  return parsed.origin;
+};
+
+const readAllowedOrigins = (value: unknown): readonly string[] => {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new ConfigError('config: "allowed_origins" must be a list of origin strings');
+  }
+  return value.map((entry, index) => readOrigin(entry, `config: allowed_origins[${index}]`));
+};
+
 export const parseConfig = (source: string, configPath: string, home: string): Config => {
   let parsed: unknown;
   try {
@@ -115,6 +171,7 @@ export const parseConfig = (source: string, configPath: string, home: string): C
     throw new ConfigError(`config at ${configPath} must be a TOML table`);
   }
   return {
+    allowedOrigins: readAllowedOrigins(parsed.allowed_origins),
     bind: readBind(parsed.bind),
     configPath,
     port: readPort(parsed.port),

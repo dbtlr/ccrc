@@ -46,7 +46,7 @@ const parseJsonBody = async (request: Request): Promise<unknown> => {
  *   `fetch` can set, so requiring it costs a browser a preflight this API never
  *   answers;
  * - a browser attaches `Origin` (and often `Sec-Fetch-Site`) to those requests,
- *   so anything not same-origin is refused outright.
+ *   so anything the operator has not named is refused outright.
  *
  * A CLI client sends neither header and is unaffected.
  */
@@ -57,19 +57,35 @@ const requireJsonContentType = (request: Request): void => {
   }
 };
 
-const requireSameOrigin = (request: Request): void => {
+/**
+ * The daemon's own origin is always trusted; `allowedOrigins` adds the reverse
+ * proxy the console is actually loaded from. Membership is exact string equality
+ * against a validated set — a near-miss on scheme, port, or path is a stranger.
+ *
+ * `Sec-Fetch-Site: cross-site` stays a flat refusal. A console served through the
+ * proxy is same-origin from the browser's point of view, so that header never
+ * describes a request the allow-list is meant to admit.
+ */
+const requireTrustedOrigin = (request: Request, allowedOrigins: ReadonlySet<string>): void => {
   if (request.headers.get('sec-fetch-site') === 'cross-site') {
     throw new ForbiddenError('cross-site requests are refused');
   }
   const origin = request.headers.get('origin');
-  if (origin !== null && origin !== new URL(request.url).origin) {
-    throw new ForbiddenError('cross-origin requests are refused');
+  if (origin === null || origin === new URL(request.url).origin || allowedOrigins.has(origin)) {
+    return;
   }
+  throw new ForbiddenError('cross-origin requests are refused');
+};
+
+export type AppOptions = {
+  /** Exact origins, already validated by config loading. */
+  readonly allowedOrigins?: readonly string[];
 };
 
 /** Wires the JSON API onto a session service. Nothing here knows about tmux. */
-export const createApp = (service: SessionService): Hono => {
+export const createApp = (service: SessionService, options: AppOptions = {}): Hono => {
   const app = new Hono();
+  const allowedOrigins = new Set(options.allowedOrigins);
 
   // Response.json rather than context.json: the numeric status carried by the
   // failure needs no narrowing to Hono's status-code union. Only deliberate
@@ -86,7 +102,7 @@ export const createApp = (service: SessionService): Hono => {
   app.use('*', async (context, next) => {
     const { method } = context.req;
     if (MUTATING_METHODS.has(method)) {
-      requireSameOrigin(context.req.raw);
+      requireTrustedOrigin(context.req.raw, allowedOrigins);
       if (BODY_METHODS.has(method)) {
         requireJsonContentType(context.req.raw);
       }
