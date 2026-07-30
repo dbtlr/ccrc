@@ -40,13 +40,15 @@ export const Board = (): JSX.Element => {
    * does not exist. A failed creation leaves its message in the notice below.
    */
   const startCreateAndLaunch = useCallback(
-    ({ name, prompt }: CreateAndLaunchRequest) => {
+    ({ name, prompt }: CreateAndLaunchRequest): Promise<void> => {
       setDismissed('');
       stop.reset();
       launch.reset();
-      create.mutate(name, {
-        onSuccess: (created) =>
-          launch.mutate({ repo: created.name, ...(prompt === undefined ? {} : { prompt }) }),
+      // Resolves when the workspace exists (the form resets on that), rejects when it
+      // could not be made (the form keeps the name for correction). The launch is
+      // still chained off the creation's success and reports into the same notice.
+      return create.mutateAsync(name).then((created) => {
+        launch.mutate({ repo: created.name, ...(prompt === undefined ? {} : { prompt }) });
       });
     },
     [create, launch, stop],

@@ -16,7 +16,7 @@ export type CreateAndLaunchRequest = {
 export type DispatchFormProps = {
   readonly launching: boolean;
   readonly onLaunch: (input: LaunchRequest) => void;
-  readonly onCreateAndLaunch: (input: CreateAndLaunchRequest) => void;
+  readonly onCreateAndLaunch: (input: CreateAndLaunchRequest) => Promise<void>;
 };
 
 /**
@@ -77,9 +77,15 @@ export const DispatchForm = ({
       const trimmed = prompt.trim();
       const message = trimmed === '' ? {} : { prompt: trimmed };
       if (naming) {
-        onCreateAndLaunch({ name: name.trim(), ...message });
-        setName('');
-        setCreating(false);
+        // The name is spent once the workspace exists — replaying it would only 409 —
+        // but a creation that failed keeps it in the field for correction.
+        void onCreateAndLaunch({ name: name.trim(), ...message }).then(
+          () => {
+            setName('');
+            setCreating(false);
+          },
+          () => undefined,
+        );
       } else {
         onLaunch({ repo, ...message });
       }
