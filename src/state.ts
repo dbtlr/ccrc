@@ -14,8 +14,29 @@ export type SessionRecord = {
   readonly rcName: string;
   readonly attachUrl: string | null;
   readonly pid: number | null;
+  /**
+   * The CLI's own id for the session this record was last correlated to. Kept for
+   * the same reason `pid` is: it is how a record claims a host entry, so a killed
+   * session's entry can never be adopted by the session that replaced it.
+   */
+  readonly hostSessionId: string | null;
   readonly startedAt: number;
+  /** When the record went terminal, or `null` while it is still active. */
+  readonly endedAt: number | null;
   readonly status: SessionStatus;
+  /** Why ccrcd retired the record, when it was not an operator's `DELETE`. */
+  readonly stopReason: string | null;
+  /** The hung record this one replaced. tmux names are never reused, so a restart
+   * is a new record rather than a revived one, and the pair is cross-linked. */
+  readonly restartedFrom: string | null;
+  readonly restartedAs: string | null;
+  /**
+   * When each automatic restart that led to this record happened. The restart cap is
+   * counted from this array and nothing else: a chain of `restartedFrom` links would
+   * be severed the moment retention pruned one of the dead records in it, which
+   * would silently reset the count and let a repo restart forever.
+   */
+  readonly restarts: readonly number[];
 };
 
 /** The next records to persist plus whatever the caller wants back out. */
@@ -45,6 +66,18 @@ const asStatus = (value: unknown): SessionStatus =>
 const asString = (value: unknown, fallback = ''): string =>
   typeof value === 'string' ? value : fallback;
 
+const asNullableString = (value: unknown): string | null =>
+  typeof value === 'string' && value.length > 0 ? value : null;
+
+const asNullableNumber = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+/** Restart history drives a kill-or-not decision, so only real timestamps count. */
+const asTimestamps = (value: unknown): readonly number[] =>
+  Array.isArray(value)
+    ? value.filter((entry): entry is number => typeof entry === 'number' && Number.isFinite(entry))
+    : [];
+
 const toSessionRecord = (value: unknown): SessionRecord | null => {
   if (!isRecord(value)) {
     return null;
@@ -55,15 +88,21 @@ const toSessionRecord = (value: unknown): SessionRecord | null => {
   }
   return {
     attachUrl: typeof value.attachUrl === 'string' ? value.attachUrl : null,
+    endedAt: asNullableNumber(value.endedAt),
     host: asString(value.host),
+    hostSessionId: asNullableString(value.hostSessionId),
     id,
     name: asString(value.name, id),
     pid: typeof value.pid === 'number' ? value.pid : null,
     rcName: asString(value.rcName),
     repoName: asString(value.repoName),
     repoPath: asString(value.repoPath),
+    restartedAs: asNullableString(value.restartedAs),
+    restartedFrom: asNullableString(value.restartedFrom),
+    restarts: asTimestamps(value.restarts),
     startedAt: typeof value.startedAt === 'number' ? value.startedAt : 0,
     status: asStatus(value.status),
+    stopReason: asNullableString(value.stopReason),
     tmuxName: asString(value.tmuxName),
   };
 };

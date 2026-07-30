@@ -31,6 +31,32 @@ const resolveTarget = async (path: string): Promise<string> => {
   }
 };
 
+/**
+ * Confirms a file at `path` could be replaced, by staging beside it exactly as an
+ * atomic write does and removing the staged file instead of renaming it.
+ *
+ * A state directory that has gone read-only is otherwise discovered at the moment a
+ * launch has to be recorded — with a `bypassPermissions` session already running and
+ * no record to stop it by. The health endpoint asks this instead.
+ */
+export const checkWritable = async (path: string): Promise<void> => {
+  const target = await resolveTarget(path);
+  await mkdir(dirname(target), { recursive: true });
+  const probe = `${target}.ccrcd-health-${crypto.randomUUID().slice(0, 8)}.tmp`;
+  try {
+    await writeFile(probe, '', { mode: DEFAULT_FILE_MODE });
+  } finally {
+    // Removal is best-effort. A failure here is not the answer the caller asked for
+    // and must not replace the write failure that is: the name is unique, so the
+    // worst case is one stray probe file rather than a misreported health check.
+    try {
+      await rm(probe, { force: true });
+    } catch {
+      // Nothing useful to do about it at this level.
+    }
+  }
+};
+
 export const writeFileAtomic = async (
   path: string,
   contents: string,

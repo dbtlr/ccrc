@@ -76,6 +76,14 @@ export class CommandTimeoutError extends CcrcError {
   }
 }
 
+/** A dependency the daemon needs could not be confirmed by a health probe. */
+export class HealthError extends CcrcError {
+  constructor(message: string) {
+    super(message, 503);
+    this.name = 'HealthError';
+  }
+}
+
 /** Config file missing or unusable — fatal at startup, never served. */
 export class ConfigError extends CcrcError {
   constructor(message: string) {

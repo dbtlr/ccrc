@@ -10,6 +10,9 @@ import type {
   LaunchRequest,
   StopOutcome,
 } from '../src/adapter/claude.ts';
+import { createLogger } from '../src/log.ts';
+import type { Logger } from '../src/log.ts';
+import type { SessionRecord } from '../src/state.ts';
 
 export const ok = (stdout = ''): CommandResult => ({ exitCode: 0, stderr: '', stdout });
 
@@ -51,6 +54,50 @@ export const fakeClock = (): { now: () => number; sleep: (ms: number) => Promise
   };
 };
 
+/** A stored session record, with only the fields a test cares about overridden. */
+export const sessionRecord = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({
+  attachUrl: 'https://claude.ai/code/session_01JQ4Z8YB0',
+  endedAt: null,
+  host: 'test-host',
+  hostSessionId: null,
+  id: 'id1',
+  name: 'example-1',
+  pid: null,
+  rcName: 'ccrc-id1',
+  repoName: 'example',
+  repoPath: '/repos/example',
+  restartedAs: null,
+  restartedFrom: null,
+  restarts: [],
+  startedAt: 1_764_000_000_000,
+  status: 'running',
+  stopReason: null,
+  tmuxName: 'ccrc-example-1',
+  ...overrides,
+});
+
+export type CapturedLog = {
+  readonly logger: Logger;
+  /** Lines written to stdout, formatted exactly as the daemon writes them. */
+  readonly info: string[];
+  readonly errors: string[];
+};
+
+/** A real logger with both sinks captured, so tests read lines instead of a stream. */
+export const capturingLogger = (now: () => number = () => 0): CapturedLog => {
+  const info: string[] = [];
+  const errors: string[] = [];
+  return {
+    errors,
+    info,
+    logger: createLogger({
+      err: (line) => void errors.push(line),
+      now,
+      out: (line) => void info.push(line),
+    }),
+  };
+};
+
 /**
  * Returns the error a promise rejected with. Used instead of `expect().rejects`,
  * whose Bun typings are not thenable and so cannot be awaited type-safely.
@@ -83,8 +130,17 @@ export type FakeAdapter = ClaudeAdapter & {
   trustFailure: Error | null;
   /** Set when tmux cannot be asked which sessions are live. */
   liveFailure: Error | null;
+  /** Transcript mtimes by session id; an id with no entry reads as indeterminate. */
+  transcripts: Record<string, number>;
+  /** Set when the transcript path itself cannot be probed. */
+  transcriptFailure: Error | null;
+  /** Set when the health probe for that dependency should fail. */
+  tmuxHealthFailure: Error | null;
+  claudeHealthFailure: Error | null;
   /** Awaited before every `listHostSessions`, to interleave requests on purpose. */
   listDelay: () => Promise<void>;
+  /** Set when the claude CLI cannot be asked for the host fleet at all. */
+  listFailure: Error | null;
   /** Awaited before every `stopSession`, to interleave requests on purpose. */
   stopDelay: () => Promise<void>;
 };
@@ -108,6 +164,15 @@ export const fakeAdapter = (): FakeAdapter => {
   const stopped: string[] = [];
   const adapter: FakeAdapter = {
     attachUrl: 'https://claude.ai/code/session_abc123',
+    checkClaude: () =>
+      adapter.claudeHealthFailure === null
+        ? Promise.resolve()
+        : Promise.reject(adapter.claudeHealthFailure),
+    checkTmux: () =>
+      adapter.tmuxHealthFailure === null
+        ? Promise.resolve()
+        : Promise.reject(adapter.tmuxHealthFailure),
+    claudeHealthFailure: null,
     hostSessions: [],
     // tmux comes up before the attach URL is polled for, so a launch that fails
     // still leaves a session behind — the case the service has to clean up after.
@@ -120,8 +185,12 @@ export const fakeAdapter = (): FakeAdapter => {
     },
     launches,
     listDelay: () => Promise.resolve(),
+    listFailure: null,
     listHostSessions: async () => {
       await adapter.listDelay();
+      if (adapter.listFailure !== null) {
+        throw adapter.listFailure;
+      }
       return adapter.hostSessions;
     },
     liveFailure: null,
@@ -142,6 +211,13 @@ export const fakeAdapter = (): FakeAdapter => {
       return adapter.stopOutcome;
     },
     stopped,
+    tmuxHealthFailure: null,
+    transcriptFailure: null,
+    transcriptMtime: (ref) =>
+      adapter.transcriptFailure === null
+        ? Promise.resolve(adapter.transcripts[ref.sessionId] ?? null)
+        : Promise.reject(adapter.transcriptFailure),
+    transcripts: {},
     trustFailure: null,
     trustRepo: (repoPath) =>
       adapter.trustFailure === null

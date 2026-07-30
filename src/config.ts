@@ -8,6 +8,23 @@ export type RepoEntry = {
   readonly path: string;
 };
 
+/**
+ * How the supervision loop is tuned. The TOML names its intervals in the units an
+ * operator thinks in (seconds, minutes, days) and they are normalised to
+ * milliseconds here, so nothing downstream has to remember which unit a key used.
+ */
+export type SupervisionConfig = {
+  /** How often the loop reconciles, watches for hangs, and prunes. */
+  readonly intervalMs: number;
+  /** How long a busy session's transcript may stand still before it is hung. */
+  readonly hangThresholdMs: number;
+  /** Most automatic restarts allowed in one restart lineage per window. */
+  readonly restartCap: number;
+  readonly restartCapWindowMs: number;
+  /** How long a stopped or failed record is kept before it is pruned. */
+  readonly stoppedRetentionMs: number;
+};
+
 export type Config = {
   readonly configPath: string;
   /** Directory holding the config file — also where `state.json` lives. */
@@ -17,11 +34,24 @@ export type Config = {
   /** Exact origins a browser may drive mutations from, beyond the daemon's own. */
   readonly allowedOrigins: readonly string[];
   readonly repos: readonly RepoEntry[];
+  readonly supervision: SupervisionConfig;
 };
 
 export const DEFAULT_BIND = '127.0.0.1';
 export const DEFAULT_PORT = 7433;
 export const STATE_FILE_NAME = 'state.json';
+
+const SECOND_MS = 1_000;
+const MINUTE_MS = 60 * SECOND_MS;
+const DAY_MS = 24 * 60 * MINUTE_MS;
+
+export const DEFAULT_SUPERVISION: SupervisionConfig = {
+  hangThresholdMs: 10 * MINUTE_MS,
+  intervalMs: 30 * SECOND_MS,
+  restartCap: 3,
+  restartCapWindowMs: 60 * MINUTE_MS,
+  stoppedRetentionMs: 7 * DAY_MS,
+};
 
 export type ConfigEnvironment = Readonly<Record<string, string | undefined>>;
 
@@ -158,6 +188,114 @@ const readAllowedOrigins = (value: unknown): readonly string[] => {
   return value.map((entry, index) => readOrigin(entry, `config: allowed_origins[${index}]`));
 };
 
+const SUPERVISION_AT = 'config: [supervision]';
+
+/**
+ * Every supervision duration is a whole number of its own unit inside a range that
+ * keeps the loop sane. Both ends matter:
+ *
+ * - a fraction is not a rounding nuisance but a behaviour change — a hang threshold
+ *   of `0.00001` minutes calls every busy session hung on the next tick;
+ * - past 2^31-1 milliseconds a timer interval wraps and fires continuously, so an
+ *   interval an operator meant as "basically never" becomes a tick storm.
+ */
+const readDuration = (
+  source: Record<string, unknown>,
+  key: string,
+  unitMs: number,
+  fallback: number,
+  range: { readonly min: number; readonly max: number },
+): number => {
+  const value = source[key];
+  if (value === undefined) {
+    return fallback;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new ConfigError(`${SUPERVISION_AT}: "${key}" must be a whole number of its own unit`);
+  }
+  if (value < range.min || value > range.max) {
+    throw new ConfigError(
+      `${SUPERVISION_AT}: "${key}" must be between ${range.min} and ${range.max}`,
+    );
+  }
+  return value * unitMs;
+};
+
+/** Frequent enough to be useful, never so frequent that ticks overlap by design. */
+const INTERVAL_SECONDS = { max: 3_600, min: 5 };
+const THRESHOLD_MINUTES = { max: 1_440, min: 1 };
+const WINDOW_MINUTES = { max: 10_080, min: 1 };
+const RETENTION_DAYS = { max: 365, min: 1 };
+
+/** `0` is a legitimate cap: it turns automatic restarts off without turning off detection. */
+const readRestartCap = (value: unknown): number => {
+  if (value === undefined) {
+    return DEFAULT_SUPERVISION.restartCap;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new ConfigError(
+      `${SUPERVISION_AT}: "restart_cap" must be an integer of 0 or more (0 disables automatic restarts)`,
+    );
+  }
+  return value;
+};
+
+const readSupervision = (value: unknown): SupervisionConfig => {
+  if (value === undefined) {
+    return DEFAULT_SUPERVISION;
+  }
+  if (!isRecord(value)) {
+    throw new ConfigError('config: "supervision" must be a [supervision] table');
+  }
+  const supervision: SupervisionConfig = {
+    hangThresholdMs: readDuration(
+      value,
+      'hang_threshold_minutes',
+      MINUTE_MS,
+      DEFAULT_SUPERVISION.hangThresholdMs,
+      THRESHOLD_MINUTES,
+    ),
+    intervalMs: readDuration(
+      value,
+      'reconcile_interval_seconds',
+      SECOND_MS,
+      DEFAULT_SUPERVISION.intervalMs,
+      INTERVAL_SECONDS,
+    ),
+    restartCap: readRestartCap(value.restart_cap),
+    restartCapWindowMs: readDuration(
+      value,
+      'restart_cap_window_minutes',
+      MINUTE_MS,
+      DEFAULT_SUPERVISION.restartCapWindowMs,
+      WINDOW_MINUTES,
+    ),
+    stoppedRetentionMs: readDuration(
+      value,
+      'stopped_retention_days',
+      DAY_MS,
+      DEFAULT_SUPERVISION.stoppedRetentionMs,
+      RETENTION_DAYS,
+    ),
+  };
+  // A window shorter than the threshold could never hold two restarts of the same
+  // session, which reads as a cap the operator did not ask for.
+  if (supervision.restartCapWindowMs < supervision.hangThresholdMs) {
+    throw new ConfigError(
+      `${SUPERVISION_AT}: "restart_cap_window_minutes" must be at least "hang_threshold_minutes"`,
+    );
+  }
+  // Restart history lives on records, and pruned records take their history with
+  // them: retention that expires inside the window would reset the restart count
+  // and let a repo that wedges every session be restarted forever.
+  if (supervision.stoppedRetentionMs < supervision.restartCapWindowMs) {
+    throw new ConfigError(
+      `${SUPERVISION_AT}: "stopped_retention_days" must cover "restart_cap_window_minutes", or pruning would drop the history the restart cap is counted from`,
+    );
+  }
+  return supervision;
+};
+
 export const parseConfig = (source: string, configPath: string, home: string): Config => {
   let parsed: unknown;
   try {
@@ -177,6 +315,7 @@ export const parseConfig = (source: string, configPath: string, home: string): C
     port: readPort(parsed.port),
     repos: readRepos(parsed.repos, home),
     stateDir: dirname(configPath),
+    supervision: readSupervision(parsed.supervision),
   };
 };
 

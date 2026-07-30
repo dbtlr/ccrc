@@ -3,23 +3,14 @@ import { chmod, lstat, readdir, readFile, stat, symlink, writeFile } from 'node:
 import { join } from 'node:path';
 
 import { createStateStore } from '../src/state.ts';
-import type { SessionRecord, StateStore } from '../src/state.ts';
-import { withTempDir } from './support.ts';
+import type { StateStore } from '../src/state.ts';
+import { sessionRecord as record, withTempDir } from './support.ts';
 
-const record = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({
-  attachUrl: 'https://claude.ai/code/session_01JQ4Z8YB0',
-  host: 'test-host',
-  id: 'id1',
-  name: 'example-1',
-  pid: null,
-  rcName: 'ccrc-id1',
-  repoName: 'example',
-  repoPath: '/repos/example',
-  startedAt: 1_764_000_000_000,
-  status: 'running',
-  tmuxName: 'ccrc-example-1',
-  ...overrides,
-});
+const append = (store: StateStore, id: string): Promise<number> =>
+  store.update((records) => ({
+    records: [...records, record({ id, tmuxName: `ccrc-example-${id}` })],
+    result: records.length,
+  }));
 
 describe('state store', () => {
   test('round-trips records and drops unusable entries', async () => {
@@ -79,11 +70,6 @@ describe('state store', () => {
       // Two stores over one file: the mutex is process-wide, not per instance.
       const first = createStateStore(filePath);
       const second = createStateStore(filePath);
-      const append = (store: StateStore, id: string): Promise<number> =>
-        store.update((records) => ({
-          records: [...records, record({ id, tmuxName: `ccrc-example-${id}` })],
-          result: records.length,
-        }));
 
       const seen = await Promise.all([
         append(first, 'id1'),

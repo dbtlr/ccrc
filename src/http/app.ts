@@ -8,6 +8,9 @@ import {
   UnsupportedMediaTypeError,
   messageOf,
 } from '../errors.ts';
+import type { HealthService } from '../health.ts';
+import { createLogger } from '../log.ts';
+import type { Logger } from '../log.ts';
 import type { LaunchInput, SessionService } from '../sessions.ts';
 import { createUiServer } from './ui.ts';
 
@@ -172,6 +175,12 @@ export type AppOptions = {
   readonly port?: number;
   /** Where the built console lives. Omitted, the app is the JSON API alone. */
   readonly uiDir?: string | undefined;
+  readonly logger?: Logger;
+  /**
+   * The dependency probes `/healthz` reports on. Omitted, the endpoint answers for
+   * the process alone — which is all an app wired without one can honestly claim.
+   */
+  readonly health?: HealthService;
 };
 
 /** Wires the JSON API onto a session service. Nothing here knows about tmux. */
@@ -181,6 +190,7 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
   const trustedOrigins = trustedOriginsFor(options.port ?? DEFAULT_PORT, allowedOrigins);
   const trustedHostnames = trustedHostnamesFor(allowedOrigins);
   const ui = options.uiDir === undefined ? undefined : createUiServer(options.uiDir);
+  const logger = options.logger ?? createLogger();
 
   // Response.json rather than context.json: the numeric status carried by the
   // failure needs no narrowing to Hono's status-code union. Only deliberate
@@ -190,7 +200,7 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
     if (failure instanceof CcrcError) {
       return Response.json({ error: failure.message }, { status: failure.status });
     }
-    process.stderr.write(`ccrcd request failed: ${failure.stack ?? messageOf(failure)}\n`);
+    logger.error(`ccrcd request failed: ${failure.stack ?? messageOf(failure)}`);
     return Response.json({ error: 'internal error' }, { status: 500 });
   });
 
@@ -206,7 +216,18 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
     return next();
   });
 
-  app.get('/healthz', (context) => context.json({ ok: true }));
+  /**
+   * A read, so it stays outside the origin and content-type gates the mutations are
+   * held to — a monitor is a plain `GET` client with no headers to offer.
+   */
+  app.get('/healthz', async (context) => {
+    const { health } = options;
+    if (health === undefined) {
+      return context.json({ checks: {}, ok: true });
+    }
+    const report = await health.check();
+    return report.ok ? context.json(report) : context.json(report, 503);
+  });
 
   // The console cannot read the TOML, so the registry it picks from comes from here.
   app.get('/repos', (context) => context.json({ repos: service.listRepos() }));

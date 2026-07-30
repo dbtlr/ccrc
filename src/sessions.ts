@@ -1,9 +1,12 @@
 import { hostname } from 'node:os';
 
+import { WORST_CASE_LAUNCH_MS } from './adapter/claude.ts';
 import type { ClaudeAdapter, HostSession, SessionActivity } from './adapter/claude.ts';
 import { findRepo } from './config.ts';
 import type { Config, RepoEntry } from './config.ts';
 import { BadRequestError, CcrcError, NotFoundError, messageOf } from './errors.ts';
+import { createLogger } from './log.ts';
+import type { Logger } from './log.ts';
 import type { SessionRecord, StateStore } from './state.ts';
 
 /**
@@ -32,12 +35,30 @@ export type RepoSummary = {
   readonly name: string;
 };
 
+/** What the hang watchdog did about one session, for logging and for tests. */
+export type HangOutcome = {
+  readonly id: string;
+  readonly reason: string;
+  /**
+   * The replacement record's id — including one whose launch failed, since that
+   * record exists and is where the session went — or `null` when no replacement was
+   * attempted at all.
+   */
+  readonly restartedAs: string | null;
+};
+
 export type SessionService = {
   readonly listRepos: () => readonly RepoSummary[];
   readonly launch: (input: LaunchInput) => Promise<SessionView>;
   readonly list: () => Promise<SessionListing>;
   readonly get: (id: string) => Promise<SessionView>;
   readonly stop: (id: string) => Promise<SessionView>;
+  /** Bring records back in line with tmux. Reads do this; so does the supervisor. */
+  readonly reconcile: () => Promise<SessionListing>;
+  /** Retire sessions that claim to be working but have stopped writing anything. */
+  readonly sweepHung: () => Promise<readonly HangOutcome[]>;
+  /** Drop terminal records past the retention window; returns how many went. */
+  readonly prune: () => Promise<number>;
 };
 
 export type SessionServiceOptions = {
@@ -47,6 +68,7 @@ export type SessionServiceOptions = {
   readonly host?: string;
   readonly now?: () => number;
   readonly generateId?: () => string;
+  readonly logger?: Logger;
 };
 
 const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyz23456789';
@@ -63,6 +85,12 @@ export const slugify = (value: string): string =>
     .replaceAll(/^-+|-+$/g, '') || 'repo';
 
 const ACTIVE_STATUSES = new Set(['starting', 'running']);
+const TERMINAL_STATUSES = new Set(['stopped', 'failed']);
+
+const MINUTE_MS = 60_000;
+
+/** Durations in a reason an operator reads are minutes, not milliseconds. */
+const minutesOf = (ms: number): number => Math.round(ms / MINUTE_MS);
 
 /** Big enough for a pasted brief, small enough to stay well inside argv limits. */
 const MAX_PROMPT_LENGTH = 32_768;
@@ -127,6 +155,41 @@ const startedTogether = (session: HostSession, record: SessionRecord): boolean =
  * as the record, and it is the only one left — anything ambiguous correlates to
  * nothing at all.
  */
+/**
+ * Whether another record already owns this host entry.
+ *
+ * A killed session lingers in `claude agents --json`, and its record keeps the pid
+ * and session id it was killed with precisely so the next session in that repo
+ * cannot adopt them: inheriting a dead session's busy report and stopped-moving
+ * transcript is a hang as far as the watchdog can tell, so a healthy replacement
+ * would be killed next tick, and its replacement after that.
+ *
+ * A dead record's claim expires with the session, though. The OS reuses pids, and a
+ * record kept for the retention window would otherwise make a legitimate new session
+ * uncorrelatable for days — no activity of its own, and no hang coverage. So a record
+ * that has ended only claims entries that existed before it did: an entry that started
+ * afterwards cannot be the session it was holding. Records written before ccrcd tracked
+ * end times have no `endedAt`, so their own start bounds them instead — the latest
+ * moment they could have been holding anything.
+ *
+ * Two things stay claimed unconditionally: a record that is still active, whose entry
+ * is its own by definition, and an entry that will not say when it started, because the
+ * alternative guesses in the dangerous direction.
+ */
+const isClaimed = (session: HostSession, others: readonly SessionRecord[]): boolean =>
+  others.some((other) => {
+    const mine =
+      (other.pid !== null && other.pid === session.pid) ||
+      (other.hostSessionId !== null && other.hostSessionId === session.sessionId);
+    if (!mine) {
+      return false;
+    }
+    if (!TERMINAL_STATUSES.has(other.status) || session.startedAt === null) {
+      return true;
+    }
+    return session.startedAt <= (other.endedAt ?? other.startedAt);
+  });
+
 const correlate = (
   record: SessionRecord,
   hostSessions: readonly HostSession[],
@@ -138,24 +201,88 @@ const correlate = (
       return byPid;
     }
   }
-  const claimed = new Set(
-    records
-      .filter((other) => other.id !== record.id && other.pid !== null)
-      .map((other) => other.pid),
-  );
+  const others = records.filter((other) => other.id !== record.id);
   const candidates = hostSessions.filter(
     (session) =>
       session.cwd === record.repoPath &&
-      !claimed.has(session.pid) &&
+      !isClaimed(session, others) &&
       startedTogether(session, record),
   );
   return candidates.length === 1 ? candidates[0] : undefined;
 };
 
-/** tmux session gone while the record still claims to be active → stopped. */
-const stopIfGone = (record: SessionRecord, live: ReadonlySet<string>): SessionRecord =>
-  ACTIVE_STATUSES.has(record.status) && !live.has(record.tmuxName)
-    ? { ...record, status: 'stopped' }
+/** What tmux was live at a known moment. The moment is the point. */
+export type LivenessSnapshot = {
+  readonly names: ReadonlySet<string>;
+  readonly takenAt: number;
+};
+
+/**
+ * How long a record is exempt from retirement after it is created.
+ *
+ * A record is written before tmux is asked for the session, and the attach URL then
+ * has its own deadline to appear, so a liveness snapshot taken anywhere in that window
+ * legitimately does not list the session yet. Retiring a record on that answer stops a
+ * session that is coming up perfectly well — and marks it `stopped` while it keeps
+ * running with `bypassPermissions`, which is the worst of both. The next tick retires
+ * it truthfully if it really is gone.
+ *
+ * Derived from the launch's own timeouts plus a margin rather than picked: the two have
+ * to move together, and the adapter owns those numbers.
+ */
+export const LAUNCH_GRACE_MS = WORST_CASE_LAUNCH_MS + 30_000;
+
+/**
+ * Whether a snapshot is entitled to speak about this record.
+ *
+ * It is not while the record is anywhere inside its launch window — including when the
+ * snapshot was taken *before* the record even existed, which is the strongest reason of
+ * all: reconciliation's own host listing can hold a snapshot for as long as the
+ * `claude` CLI takes to answer, and a launch landing in that gap is milliseconds to
+ * seconds newer than it.
+ *
+ * The one thing that cannot be a launch race is a record stamped further ahead than a
+ * whole launch window, which is what a clock corrected backwards leaves behind. That is
+ * judged by magnitude, and only there, because a grace period measured from a future
+ * timestamp would otherwise never expire: the record would never be retired, never
+ * promoted, and never pruned, since it is not terminal.
+ */
+const launchWindowPassed = (record: SessionRecord, live: LivenessSnapshot): boolean =>
+  record.startedAt - live.takenAt > LAUNCH_GRACE_MS ||
+  record.startedAt + LAUNCH_GRACE_MS <= live.takenAt;
+
+/**
+ * Whether an active record's tmux session is gone, as far as this snapshot can say.
+ * This is also the whole of ccrcd's reboot story: a rebooted host has an empty tmux
+ * server, so the first reconciliation retires every record it left behind. Nothing is
+ * ever relaunched from that — a machine coming back up must not start running
+ * `bypassPermissions` sessions on its own.
+ *
+ * The snapshot is compared against the record's age, not against the clock: a
+ * snapshot only speaks for the moment it was taken, and reconciliation's own host
+ * listing can hold it for as long as the `claude` CLI takes to answer.
+ */
+const isGone = (record: SessionRecord, live: LivenessSnapshot): boolean =>
+  ACTIVE_STATUSES.has(record.status) &&
+  !live.names.has(record.tmuxName) &&
+  launchWindowPassed(record, live);
+
+/**
+ * A `starting` record with a live tmux session, long past any launch that could
+ * still be in progress → running.
+ *
+ * A daemon killed mid-launch leaves exactly that: the launch that would have settled
+ * the record is gone, so nothing will ever move it off `starting` — while the session
+ * it started keeps running with `bypassPermissions`. The record is corrected to what
+ * tmux says rather than left immortal. The attach URL stays null: it is printed once
+ * into the pane and was never captured, and a record saying "running, URL unknown" is
+ * the truth. (A record whose tmux session is gone is retired by `retireGone` first.)
+ */
+const promoteIfStranded = (record: SessionRecord, live: LivenessSnapshot): SessionRecord =>
+  record.status === 'starting' &&
+  live.names.has(record.tmuxName) &&
+  launchWindowPassed(record, live)
+    ? { ...record, status: 'running' }
     : record;
 
 const withoutRepoPath = (record: SessionRecord): Omit<SessionRecord, 'repoPath'> => {
@@ -179,6 +306,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   const host = options.host ?? hostname();
   const now = options.now ?? Date.now;
   const generateId = options.generateId ?? randomId;
+  const logger = options.logger ?? createLogger();
 
   /**
    * A tmux that will not say which sessions are live makes liveness indeterminate,
@@ -187,12 +315,15 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
    * sessions are still running, so the listing is served unreconciled instead and
    * the reason is logged for the operator.
    */
-  const liveNamesOrUnknown = async (): Promise<ReadonlySet<string> | undefined> => {
+  const liveNamesOrUnknown = async (): Promise<LivenessSnapshot | undefined> => {
     try {
-      return new Set(await adapter.liveSessionNames());
+      const names = new Set(await adapter.liveSessionNames());
+      // Timed on return, not on use: what follows may hold this answer for as long
+      // as the claude CLI takes, and a launch can land in that gap.
+      return { names, takenAt: now() };
     } catch (cause) {
-      process.stderr.write(
-        `ccrcd could not read live tmux sessions, so records were left as they are: ${messageOf(cause)}\n`,
+      logger.error(
+        `ccrcd could not read live tmux sessions, so records were left as they are: ${messageOf(cause)}`,
       );
       return undefined;
     }
@@ -208,9 +339,74 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       liveNamesOrUnknown(),
       adapter.listHostSessions(),
     ]);
+    /**
+     * The host entry a dying record may claim, or nothing.
+     *
+     * A killed session's entry lingers in the fleet listing, and claiming it is what
+     * stops the next session in that repo from adopting it. But the dying record's own
+     * entry may have dropped out of the listing already, and correlation is a cwd-and-
+     * time-window fallback: what it hands back can then be a *live* sibling's entry —
+     * one launched around the same time in the same repo that the CLI has not correlated
+     * yet either. Stamping that would suppress the living session's own correlation for
+     * as long as the dead record is kept: no activity, and no hang coverage, for a
+     * session running with `bypassPermissions`.
+     *
+     * So an entry is only claimed when nothing whose tmux session is still live could
+     * own it. Declining costs a claim; taking it wrongly costs a live session its
+     * supervision.
+     */
+    const claimableEntry = (
+      record: SessionRecord,
+      records: readonly SessionRecord[],
+      snapshot: LivenessSnapshot,
+    ): HostSession | undefined => {
+      const matched = correlate(record, hostSessions, records);
+      if (matched === undefined) {
+        return undefined;
+      }
+      const repoPath = matched.cwd ?? record.repoPath;
+      const contested = records.some(
+        (other) =>
+          other.id !== record.id &&
+          snapshot.names.has(other.tmuxName) &&
+          other.repoPath === repoPath &&
+          // A record that already correlated owns something else; only one with no
+          // identifiers of its own could still turn out to own this entry.
+          other.pid === null &&
+          other.hostSessionId === null &&
+          startedTogether(matched, other),
+      );
+      return contested ? undefined : matched;
+    };
+
+    /**
+     * A session that died on its own — crashed, exited, or had its tmux session killed
+     * outside ccrcd — is retired here and nowhere else, so this is the only chance to
+     * claim the host entry it leaves behind. The listing is already in hand from the
+     * same read, so the claim costs nothing; without it the next session in that repo
+     * can adopt the dead entry, and the watchdog will kill it on a stranger's stale
+     * transcript.
+     */
+    const retireGone = (
+      record: SessionRecord,
+      records: readonly SessionRecord[],
+      snapshot: LivenessSnapshot,
+    ): SessionRecord => ({
+      ...record,
+      ...claimOf(record, claimableEntry(record, records, snapshot)),
+      status: 'stopped',
+      stopReason: record.stopReason ?? 'its tmux session was gone',
+    });
+
     const sessions = await store.update((records) => {
       const reconciled =
-        live === undefined ? records : records.map((record) => stopIfGone(record, live));
+        live === undefined
+          ? records
+          : records.map((record) =>
+              isGone(record, live)
+                ? retireGone(record, records, live)
+                : promoteIfStranded(record, live),
+            );
       const changed = reconciled.some((record, index) => record.status !== records[index]?.status);
       return { records: changed ? reconciled : records, result: changed ? reconciled : records };
     });
@@ -234,16 +430,25 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
   };
 
-  const launch = async (input: LaunchInput): Promise<SessionView> => {
-    if (typeof input.repo !== 'string' || input.repo.length === 0) {
-      throw new BadRequestError('"repo" is required and must be a registry repo name');
-    }
-    const repo = findRepo(config, input.repo);
-    if (repo === undefined) {
-      throw new NotFoundError(`unknown repo "${input.repo}"`);
-    }
-    const prompt = checkPrompt(input.prompt);
-
+  /**
+   * Starts a session and settles its record — the whole of a launch after the
+   * request has been validated. The watchdog's relaunch comes through here too, so
+   * a restarted session is allocated, named, and correlated exactly like an
+   * operator's launch; `restartedFrom` is the only difference.
+   */
+  const startSession = async (start: {
+    readonly repo: RepoEntry;
+    readonly prompt?: string | undefined;
+    readonly restartedFrom?: string | null;
+    readonly restarts?: readonly number[];
+    /** Called once the record exists, so a caller can name it even if the launch fails. */
+    readonly onPending?: (record: SessionRecord) => void;
+  }): Promise<{
+    readonly record: SessionRecord;
+    readonly records: readonly SessionRecord[];
+    readonly hostSessions: readonly HostSession[];
+  }> => {
+    const { prompt, repo } = start;
     const repoPath = await trustedPath(repo);
     const liveNames = await adapter.liveSessionNames();
     // Allocating the name and recording it are one serialized step: concurrent
@@ -253,19 +458,26 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       const id = generateId();
       const record: SessionRecord = {
         attachUrl: null,
+        endedAt: null,
         host,
+        hostSessionId: null,
         id,
         name: `${repo.name}-${index}`,
         pid: null,
         rcName: `ccrc-${id}`,
         repoName: repo.name,
         repoPath,
+        restartedAs: null,
+        restartedFrom: start.restartedFrom ?? null,
+        restarts: start.restarts ?? [],
         startedAt: now(),
         status: 'starting',
+        stopReason: null,
         tmuxName,
       };
       return { records: [...records, record], result: record };
     });
+    start.onPending?.(pending);
 
     /**
      * The settled record is built inside the store's critical section, so the pid
@@ -305,21 +517,60 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         tmuxName: pending.tmuxName,
       });
       const hostSessions = await adapter.listHostSessions();
-      const { record, records } = await settle((current) => ({
-        ...pending,
-        attachUrl,
-        pid: correlate(pending, hostSessions, current)?.pid ?? null,
-        status: 'running',
-      }));
-      return toView(record, hostSessions, records);
+      const { record, records } = await settle((current) => {
+        // Built onto the record as it stands, never onto the pre-launch snapshot: a
+        // `DELETE` that landed while this launch was settling has already written to
+        // it, and spreading the snapshot would revert that stop — leaving a record
+        // that claims to be running with no tmux session behind it.
+        const stored = current.find((entry) => entry.id === pending.id) ?? pending;
+        const matched = correlate(pending, hostSessions, current);
+        const learned = {
+          attachUrl,
+          // Both identifiers are kept: they are how this record claims its host
+          // entry against every other record's correlation.
+          hostSessionId: matched?.sessionId ?? null,
+          pid: matched?.pid ?? null,
+        };
+        // A record that went terminal mid-launch stays terminal. Its tmux session is
+        // already dead — or reconciliation will find it so — and nothing may promote
+        // it back to running.
+        return TERMINAL_STATUSES.has(stored.status)
+          ? { ...stored, ...learned }
+          : { ...stored, ...learned, status: 'running' };
+      });
+      return { hostSessions, record, records };
     } catch (cause) {
       await tearDown(pending.tmuxName);
-      await settle((current) => ({
-        ...(current.find((entry) => entry.id === pending.id) ?? pending),
-        status: 'failed',
-      }));
+      await settle((current) => {
+        const stored = current.find((entry) => entry.id === pending.id) ?? pending;
+        // An operator's stop that got there first is the truthful account of how this
+        // record ended; a failed launch must not overwrite it.
+        return TERMINAL_STATUSES.has(stored.status)
+          ? stored
+          : {
+              ...stored,
+              endedAt: now(),
+              status: 'failed',
+              // Only a deliberate failure describes itself: anything else may carry a
+              // command line or a host path, and the reason is served to clients.
+              stopReason: cause instanceof CcrcError ? cause.message : 'the launch failed',
+            };
+      });
       throw cause;
     }
+  };
+
+  const launch = async (input: LaunchInput): Promise<SessionView> => {
+    if (typeof input.repo !== 'string' || input.repo.length === 0) {
+      throw new BadRequestError('"repo" is required and must be a registry repo name');
+    }
+    const repo = findRepo(config, input.repo);
+    if (repo === undefined) {
+      throw new NotFoundError(`unknown repo "${input.repo}"`);
+    }
+    const prompt = checkPrompt(input.prompt);
+    const started = await startSession({ prompt, repo });
+    return toView(started.record, started.hostSessions, started.records);
   };
 
   const listRepos = (): readonly RepoSummary[] => config.repos.map((repo) => ({ name: repo.name }));
@@ -333,6 +584,51 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       throw new NotFoundError(`unknown session "${id}"`);
     }
     return found;
+  };
+
+  /**
+   * What the record keeps of the session that was just killed.
+   *
+   * Every path that kills a session goes through this, because the claim is what
+   * stops the next session in the same repo from adopting the dead one's entry:
+   * `claude agents --json` still lists a killed session for a while, and a record
+   * that adopted it would report a stranger's activity and be killed by the watchdog
+   * on a stranger's stale transcript. An operator's `DELETE` needs it exactly as much
+   * as the watchdog's kill does — stop, then relaunch, is the ordinary workflow.
+   */
+  const claimOf = (
+    record: SessionRecord,
+    killed: HostSession | undefined,
+  ): Pick<SessionRecord, 'endedAt' | 'hostSessionId' | 'pid'> => ({
+    // Stamped once. A restart rewrites this record's reason twice more before it is
+    // done — once its replacement is known — and the end time must not walk forward
+    // with those writes: retention is measured from it, and it is the only account of
+    // when the session actually stopped.
+    endedAt: record.endedAt ?? now(),
+    hostSessionId: killed?.sessionId ?? record.hostSessionId,
+    pid: killed?.pid ?? record.pid,
+  });
+
+  /**
+   * The host entry a record is running as, as far as the fleet listing can say.
+   *
+   * A CLI that will not answer costs the claim, nothing more. Stopping a session is the
+   * one operation that has to work when the host is misbehaving — a wedged `claude`
+   * would otherwise fail the `DELETE`, leave the tmux session running, and leave the
+   * record claiming to be alive, which is the opposite of what the caller asked for.
+   */
+  const hostEntryOrNothing = async (
+    record: SessionRecord,
+    records: readonly SessionRecord[],
+  ): Promise<HostSession | undefined> => {
+    try {
+      return correlate(record, await adapter.listHostSessions(), records);
+    } catch (cause) {
+      logger.error(
+        `ccrcd could not read the host fleet while stopping session ${record.id}, so its host entry was not claimed: ${messageOf(cause)}`,
+      );
+      return undefined;
+    }
   };
 
   /**
@@ -350,13 +646,23 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     if (target === undefined) {
       throw new NotFoundError(`unknown session "${id}"`);
     }
+    // Read before the kill: afterwards the entry starts disappearing from the fleet
+    // listing, and an unclaimed entry is one the next launch can adopt.
+    const killed = await hostEntryOrNothing(target, stored);
     await adapter.stopSession(target.tmuxName);
     const stopped = await store.update((records) => {
       const current = records.find((record) => record.id === id);
       if (current === undefined) {
         throw new NotFoundError(`unknown session "${id}"`);
       }
-      const next: SessionRecord = { ...current, status: 'stopped' };
+      // No reason: an operator's own `DELETE` needs no explanation, and a reason
+      // left over from an earlier ccrcd decision would be the wrong one.
+      const next: SessionRecord = {
+        ...current,
+        ...claimOf(current, killed),
+        status: 'stopped',
+        stopReason: null,
+      };
       return {
         records: records.map((record) => (record.id === id ? next : record)),
         result: next,
@@ -365,5 +671,207 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { ...withoutRepoPath(stopped), activity: 'unknown' };
   };
 
-  return { get, launch, list, listRepos, stop };
+  /** Retires a record ccrcd decided to end, with the reason it decided that. */
+  const retire = (
+    id: string,
+    reason: string,
+    restartedAs: string | null,
+    killed?: HostSession,
+  ): Promise<void> =>
+    store.update((records) => {
+      const current = records.find((record) => record.id === id);
+      if (current === undefined) {
+        return { records, result: undefined };
+      }
+      const next: SessionRecord = {
+        ...current,
+        ...claimOf(current, killed),
+        restartedAs,
+        status: 'stopped',
+        stopReason: reason,
+      };
+      return {
+        records: records.map((record) => (record.id === id ? next : record)),
+        result: undefined,
+      };
+    });
+
+  /**
+   * How stale a busy session's transcript is, or `null` when it is not hung.
+   *
+   * Two signals have to agree before a session is killed: the session says it is
+   * `busy`, and the transcript it would be appending to has not moved for the
+   * threshold. Everything else — an idle session, a session with no status of its
+   * own, one that could not be correlated, one with no session id, a transcript
+   * that cannot be read — is unknown, and unknown never trips the watchdog. Killing
+   * a working session because ccrcd could not see its transcript would destroy work
+   * nobody asked it to touch.
+   */
+  const staleFor = async (record: SessionRecord, session: HostSession): Promise<number | null> => {
+    if (session.status !== 'busy' || session.sessionId === null) {
+      return null;
+    }
+    let mtime: number | null;
+    try {
+      mtime = await adapter.transcriptMtime({
+        cwd: session.cwd ?? record.repoPath,
+        sessionId: session.sessionId,
+      });
+    } catch (cause) {
+      logger.error(
+        `ccrcd could not read the transcript of session ${record.id}, so it was left running: ${messageOf(cause)}`,
+      );
+      return null;
+    }
+    if (mtime === null) {
+      return null;
+    }
+    const idleFor = now() - mtime;
+    return idleFor >= config.supervision.hangThresholdMs ? idleFor : null;
+  };
+
+  /**
+   * The automatic restarts behind this record that still fall inside the window.
+   *
+   * The history is carried by the record itself and handed to each replacement, so
+   * the count survives everything that happens to the dead records: retention
+   * pruning them, an operator deleting them, a state file rewritten by hand. Walking
+   * `restartedFrom` instead would reset the count the moment one link went missing —
+   * which is the state prune leaves behind by design.
+   */
+  const recentRestarts = (record: SessionRecord): readonly number[] => {
+    const since = now() - config.supervision.restartCapWindowMs;
+    return record.restarts.filter((at) => at >= since);
+  };
+
+  /**
+   * Kills the hung session, then starts a fresh one in the same repo. The tmux name
+   * is never reused, so the replacement is a new record and the two are cross-linked
+   * both ways.
+   *
+   * A kill tmux refuses leaves the record active and untouched: a session that is
+   * still running must not be recorded as stopped, and the next tick will try again.
+   */
+  const restartHung = async (
+    record: SessionRecord,
+    session: HostSession,
+    idleFor: number,
+  ): Promise<HangOutcome | null> => {
+    const symptom = `hung (busy ${minutesOf(idleFor)} min with a transcript that stopped moving)`;
+    try {
+      await adapter.stopSession(record.tmuxName);
+    } catch (cause) {
+      logger.error(
+        `ccrcd found session ${record.id} ${symptom} but tmux refused to kill it, so the record was left active: ${messageOf(cause)}`,
+      );
+      return null;
+    }
+    const { restartCap, restartCapWindowMs } = config.supervision;
+    const already = recentRestarts(record);
+    if (already.length >= restartCap) {
+      const reason = `${symptom}; the automatic restart cap of ${restartCap} per ${minutesOf(restartCapWindowMs)} min was reached, so it was not restarted`;
+      await retire(record.id, reason, null, session);
+      logger.error(
+        `ccrcd stopped session ${record.id} in repo ${record.repoName} and will not restart it: ${reason}. Sessions in that repo keep wedging — it needs an operator.`,
+      );
+      return { id: record.id, reason, restartedAs: null };
+    }
+    const repo = findRepo(config, record.repoName);
+    if (repo === undefined) {
+      const reason = `${symptom}; repo "${record.repoName}" is no longer in the registry, so it was not restarted`;
+      await retire(record.id, reason, null, session);
+      logger.error(`ccrcd stopped session ${record.id}: ${reason}`);
+      return { id: record.id, reason, restartedAs: null };
+    }
+    /**
+     * The record is retired — and so claims the killed session's host entry — before
+     * the replacement is started. The other order lets the replacement's own
+     * correlation adopt the dead entry it was launched to replace, and the watchdog
+     * then reads that entry's stale transcript as the replacement hanging.
+     */
+    await retire(record.id, `${symptom}; a replacement is being started`, null, session);
+    // The replacement's id is captured as soon as its record exists, so a launch
+    // that fails still leaves the two records pointing at each other — a dead end on
+    // one side hides where the session went.
+    const attempt: { id: string | null; started: boolean } = { id: null, started: false };
+    try {
+      // The replacement inherits this record's restart history plus this restart, so
+      // the cap is enforced against the live record alone.
+      await startSession({
+        onPending: (pending) => {
+          attempt.id = pending.id;
+        },
+        repo,
+        restartedFrom: record.id,
+        restarts: [...already, now()],
+      });
+      attempt.started = true;
+    } catch (cause) {
+      logger.error(
+        `ccrcd stopped hung session ${record.id} but could not start its replacement: ${messageOf(cause)}`,
+      );
+    }
+    const replacement = attempt.id;
+    if (!attempt.started) {
+      const reason =
+        replacement === null
+          ? `${symptom}; a replacement session could not be created`
+          : `${symptom}; its replacement ${replacement} failed to start`;
+      await retire(record.id, reason, replacement, session);
+      return { id: record.id, reason, restartedAs: replacement };
+    }
+    const reason = `${symptom}; restarted as ${replacement}`;
+    await retire(record.id, reason, replacement, session);
+    logger.info(
+      `ccrcd restarted session ${record.id} in repo ${record.repoName} as ${replacement}: ${symptom}`,
+    );
+    return { id: record.id, reason, restartedAs: replacement };
+  };
+
+  const sweepHung = async (): Promise<readonly HangOutcome[]> => {
+    const records = await store.load();
+    const running = records.filter((record) => record.status === 'running');
+    if (running.length === 0) {
+      return [];
+    }
+    const hostSessions = await adapter.listHostSessions();
+    const checked = await Promise.all(
+      running.map(async (record) => {
+        const session = correlate(record, hostSessions, records);
+        if (session === undefined) {
+          return null;
+        }
+        const idleFor = await staleFor(record, session);
+        return idleFor === null ? null : { idleFor, record, session };
+      }),
+    );
+    // Restarts run together: each one allocates its tmux name inside the store's
+    // critical section, so two replacements can never claim the same name.
+    const outcomes = await Promise.all(
+      checked
+        .filter((entry) => entry !== null)
+        .map((entry) => restartHung(entry.record, entry.session, entry.idleFor)),
+    );
+    return outcomes.filter((outcome) => outcome !== null);
+  };
+
+  /**
+   * Terminal records are history, and history is not kept forever: the state file is
+   * read and rewritten on nearly every request, so an unbounded one is a growing
+   * cost on every launch. Retention is measured from when the record ended, not from
+   * when it started, so a long session that stopped a minute ago is still recent.
+   */
+  const prune = (): Promise<number> =>
+    store.update((records) => {
+      const cutoff = now() - config.supervision.stoppedRetentionMs;
+      const kept = records.filter(
+        (record) =>
+          !TERMINAL_STATUSES.has(record.status) || (record.endedAt ?? record.startedAt) > cutoff,
+      );
+      return kept.length === records.length
+        ? { records, result: 0 }
+        : { records: kept, result: records.length - kept.length };
+    });
+
+  return { get, launch, list, listRepos, prune, reconcile, stop, sweepHung };
 };

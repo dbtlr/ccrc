@@ -64,6 +64,31 @@ path = "~/notes"
 Only repos in this registry can be launched; `POST /sessions` takes a registry `name`, never
 a path.
 
+### Supervision settings
+
+The daemon keeps its own house in order on a timer. Every key below is optional and shown
+with its default:
+
+```toml
+[supervision]
+reconcile_interval_seconds = 30   # how often the loop runs
+hang_threshold_minutes = 10       # busy + transcript this stale = hung
+restart_cap = 3                   # automatic restarts per lineage per window (0 = never)
+restart_cap_window_minutes = 60
+stopped_retention_days = 7        # how long stopped/failed records are kept
+```
+
+Every duration is a whole number of its own unit inside a range that keeps the loop sane,
+and `restart_cap` is a whole number of 0 or more; anything else is a fatal startup error
+rather than a setting that silently misbehaves.
+
+| Key                          | Range                                                                                                                                         | Why the ends matter                                                                                                        |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `reconcile_interval_seconds` | 5–3600                                                                                                                                        | Under a few seconds ticks pile onto each other; past 2^31-1 ms a timer wraps and fires continuously.                       |
+| `hang_threshold_minutes`     | 1–1440                                                                                                                                        | A fraction of a minute would call every busy session hung on the next tick.                                                |
+| `restart_cap_window_minutes` | 1–10080, and at least `hang_threshold_minutes`                                                                                                | A window shorter than the threshold could never hold two restarts of one session.                                          |
+| `stopped_retention_days`     | 1–365, and at least `restart_cap_window_minutes` expressed in days (`ceil(minutes / 1440)`, so the default 60-minute window needs just 1 day) | Restart history lives on records; retention that expires inside the window would drop the history the cap is counted from. |
+
 ### Behind a reverse proxy
 
 The daemon stays loopback-bound, so reaching the console from a phone means fronting it with
@@ -103,6 +128,80 @@ bun run build          # builds the web console into ui/dist
 bun run start          # or: bun run dev  (reloads on change)
 CCRC_CONFIG=/path/to/config.toml bun run start
 ```
+
+Every log line is one line, prefixed with an ISO-8601 timestamp; ordinary events go to
+stdout and failures to stderr.
+
+## Run as a service
+
+On macOS, a per-user LaunchAgent starts the daemon at login and restarts it if it exits.
+The committed plist is a template — the installer fills in the host's paths (`bun` from
+`PATH`, the checkout the script lives in, `$HOME`, `$PATH`, and the config location) and
+loads the agent:
+
+```sh
+packaging/launchd/install.sh     # writes ~/Library/LaunchAgents/dev.ccrc.ccrcd.plist
+packaging/launchd/uninstall.sh   # unloads it and removes the plist
+```
+
+Logs land in `~/Library/Logs/ccrc/ccrcd.out.log` and `ccrcd.err.log`. **Nothing rotates
+them** — launchd appends until something else truncates them, so they belong in whatever
+log rotation the host already runs.
+
+The installer refuses to run unless `bun`, `tmux`, and the `claude` CLI are all on the
+`PATH` it captures (the agent inherits that `PATH` and nothing else, so a tool missing from
+it fails every launch) and the config already exists — a missing config is a fatal startup
+error, and `KeepAlive` would turn that into a restart loop. `ThrottleInterval` spaces failed
+starts 30 seconds apart so a daemon that cannot start at all cannot spin; the error log is
+still where you find out. Set `CCRC_CONFIG` when installing to point the agent at a config
+elsewhere. It is a user agent, not a system daemon: sessions run as the operator, and
+nothing starts before login.
+
+Uninstalling only removes the agent. Sessions already running under tmux stay up; stop them
+through the API.
+
+## Supervision
+
+Reconciliation used to happen only when a client read the API. A loop inside the daemon now
+runs every `reconcile_interval_seconds`, plus once at startup, and does three things:
+
+1. **Reconcile.** Records whose tmux session is gone are marked `stopped`. That is also the
+   whole of the reboot story: a rebooted host has an empty tmux server, so the startup tick
+   retires everything left over. Nothing is ever relaunched on boot — a host coming back up
+   must not start `bypassPermissions` sessions on its own. Two things keep this honest: a
+   record is exempt from retirement for as long as a launch could still be running (the
+   launch timeouts plus a margin), because a liveness snapshot taken during a launch
+   legitimately does not list the session yet — including a snapshot taken _before_ the
+   record existed, which a slow fleet listing makes ordinary. Only a record stamped
+   further ahead than a whole launch window forfeits that, since a clock corrected
+   backwards would otherwise make it immortal. And a `starting` record past the window
+   whose tmux session _is_ live is promoted to `running`,
+   which is what a daemon killed mid-launch leaves behind (its `attachUrl` stays `null` —
+   the URL is printed once into the pane and was never captured).
+2. **Watch for hangs.** A session is hung only when two signals agree: it reports itself
+   `busy`, _and_ the transcript it would be writing to has not moved for
+   `hang_threshold_minutes`. Anything indeterminate — an idle session, a session that
+   reports no status, one that cannot be correlated to a record, one whose transcript cannot
+   be read — never trips the watchdog. A hung session's tmux session is killed, its record
+   is marked `stopped` with the reason, and a fresh session is launched in the same repo.
+   tmux names are never reused, so the replacement is a new record: it carries
+   `restartedFrom`, the retired one carries `restartedAs`. The replacement starts with no
+   prompt; the original first message is not stored and is not replayed.
+3. **Prune.** `stopped` and `failed` records older than `stopped_retention_days` are dropped,
+   measured from when the record ended rather than when it started.
+
+At most `restart_cap` automatic restarts happen per restart lineage within
+`restart_cap_window_minutes`. The count comes from `restarts` — the timestamps of the
+restarts behind a record, handed to each replacement — rather than from walking
+`restartedFrom` links, so pruning, deleting, or hand-editing the dead records cannot reset
+it. Past the cap the session is still killed but not replaced, the record says the cap was
+reached, and the daemon logs loudly: sessions in that repo keep wedging and want a human.
+
+Ticks never overlap — a tick arriving while one is still running is dropped, not queued — and
+every phase is caught and logged on its own, so a tmux that cannot answer neither skips the
+prune nor stops the loop nor takes the daemon down. Dropped ticks are logged; a run of more
+than three in a row is logged as an error, because that means a tick is wedged and nothing
+is being reconciled, watched, or pruned at all.
 
 ## Web console
 
@@ -148,7 +247,7 @@ loopback-reachable read-only file server over that directory instead.
 All responses are JSON. Errors are `{ "error": "..." }` with a 4xx/5xx status.
 
 ```sh
-# liveness
+# health: tmux reachable, claude CLI reachable, state file writable
 curl -s http://127.0.0.1:7433/healthz
 
 # the repo names a launch will accept (paths stay on the host)
@@ -169,6 +268,21 @@ curl -s http://127.0.0.1:7433/sessions/<id>
 curl -s -X DELETE http://127.0.0.1:7433/sessions/<id>
 ```
 
+`GET /healthz` probes the three things the daemon cannot work without, each bounded by a
+short two-second timeout so health answers while the trouble is happening:
+
+```json
+{ "ok": true, "checks": { "tmux": "ok", "claude": "ok", "state": "ok" } }
+```
+
+A failed check answers `503` with that check marked `failed`. _Why_ it failed goes to the
+log, not the response: a probe failure quotes host paths and command output, and `/healthz`
+is the one route with no origin check in front of it.
+
+Each run spawns processes, so concurrent callers share one run and the answer is reused for
+five seconds. That bounds the spawn rate however hard the route is hit — and means a
+dependency that has just recovered reads as unwell for up to that long.
+
 A session record looks like:
 
 ```json
@@ -181,11 +295,31 @@ A session record looks like:
   "rcName": "ccrc-k7m2p4qd",
   "attachUrl": "https://claude.ai/code/session_01JQ4Z8YB0",
   "pid": 4242,
+  "hostSessionId": "0c2f1d6e-...",
   "startedAt": 1764000000000,
+  "endedAt": null,
   "status": "running",
+  "stopReason": null,
+  "restartedFrom": null,
+  "restartedAs": null,
+  "restarts": [],
   "activity": "idle"
 }
 ```
+
+`endedAt` is when the record went terminal, and `stopReason` is why — set when ccrcd decided
+to end it (its tmux session was gone, a launch failed, the watchdog found it hung) and left
+`null` for an operator's own `DELETE`. `restartedFrom` and `restartedAs` cross-link a hung
+session to the one that replaced it, in both directions and even when the replacement's own
+launch failed. `pid` and `hostSessionId` are how a record claims its entry in the host
+fleet, which is what stops the next session in a repo from adopting a killed session's
+entry — the CLI lists a killed session for a while, and an adopted entry would hand a
+healthy session a stranger's activity and a stranger's stale transcript. Every kill claims
+it — an operator's `DELETE`, the watchdog's restart, and a session that died on its own
+and is found by reconciliation. A `DELETE` still kills the tmux session and retires the
+record when the `claude` CLI cannot be reached at all; it just has no claim to record. The claim expires with the session: a record that has
+ended only claims entries that started before it did, so a pid the OS later reuses is free.
+`restarts` is the automatic-restart history the cap is counted from.
 
 The repo's configured path stays on the host — same as `GET /repos` — so it is never part
 of a session record either.
@@ -207,6 +341,9 @@ contain NUL bytes.
 
 `status` is only advanced to `stopped` on a definite answer: if tmux cannot say which
 sessions are live, records are served as they stand rather than retired wholesale.
+
+Records are reconciled on every read and by the supervision loop, so a record can change
+between two reads without anyone calling `DELETE` — see [Supervision](#supervision).
 
 ## Development
 

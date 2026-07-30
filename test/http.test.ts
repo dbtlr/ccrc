@@ -4,11 +4,13 @@ import { join } from 'node:path';
 import { loadConfig, stateFilePath } from '../src/config.ts';
 import type { Config } from '../src/config.ts';
 import { LaunchError, LivenessError, StopError } from '../src/errors.ts';
+import { createHealthService } from '../src/health.ts';
 import { createApp } from '../src/http/app.ts';
 import { createSessionService } from '../src/sessions.ts';
+import type { SessionService } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
-import { fakeAdapter, hostSession, withTempDir } from './support.ts';
-import type { FakeAdapter } from './support.ts';
+import { capturingLogger, fakeAdapter, hostSession, withTempDir } from './support.ts';
+import type { CapturedLog, FakeAdapter } from './support.ts';
 
 const CONFIG_TOML = `bind = "127.0.0.1"
 port = 7433
@@ -28,6 +30,10 @@ type Harness = {
   readonly app: ReturnType<typeof createApp>;
   readonly config: Config;
   readonly statePath: string;
+  readonly log: CapturedLog;
+  readonly service: SessionService;
+  /** Moves the service's clock, for the windows reconciliation measures in time. */
+  readonly at: (ms: number) => void;
 };
 
 let sequence = 0;
@@ -38,6 +44,8 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
   const config = await loadConfig({ CCRC_CONFIG: configPath }, join(dir, 'home'));
   const adapter = fakeAdapter();
   const statePath = stateFilePath(config);
+  const log = capturingLogger();
+  let current = 1_764_000_000_000;
   const service = createSessionService({
     adapter,
     config,
@@ -46,13 +54,24 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
       return `id${sequence}`;
     },
     host: 'test-host',
-    now: () => 1_764_000_000_000,
+    logger: log.logger,
+    now: () => current,
     store: createStateStore(statePath),
   });
   return {
     adapter,
-    app: createApp(service, { allowedOrigins: config.allowedOrigins, port: config.port }),
+    app: createApp(service, {
+      allowedOrigins: config.allowedOrigins,
+      health: createHealthService({ adapter, logger: log.logger, statePath }),
+      logger: log.logger,
+      port: config.port,
+    }),
+    at: (ms) => {
+      current = ms;
+    },
     config,
+    log,
+    service,
     statePath,
   };
 };
@@ -77,12 +96,58 @@ beforeEach(() => {
 });
 
 describe('healthz', () => {
-  test('answers ok', async () => {
+  test('answers ok once every dependency has answered', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
+
       const response = await harnessed.app.request('/healthz');
+
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ ok: true });
+      expect(await response.json()).toEqual({
+        checks: { claude: 'ok', state: 'ok', tmux: 'ok' },
+        ok: true,
+      });
+    });
+  });
+
+  test('answers 503 naming the dependency that is unwell', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.tmuxHealthFailure = new Error('error connecting to the tmux server');
+
+      const response = await harnessed.app.request('/healthz');
+
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({
+        checks: { claude: 'ok', state: 'ok', tmux: 'failed' },
+        ok: false,
+      });
+      // Why it failed stays in the log rather than on the wire.
+      expect(harnessed.log.errors.join('')).toMatch(/health check "tmux" failed/);
+    });
+  });
+
+  test('answers for the process alone when no probes are wired', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      const bare = createApp(harnessed.service);
+
+      const response = await bare.request('/healthz');
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ checks: {}, ok: true });
+    });
+  });
+
+  test('stays a plain GET, with no origin or content-type gate', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await harnessed.app.request('/healthz', {
+        headers: { origin: 'https://stranger.example' },
+      });
+
+      expect(response.status).toBe(200);
     });
   });
 });
@@ -287,8 +352,10 @@ describe('session lifecycle', () => {
       const harnessed = await harness(dir);
       await postSession(harnessed, { repo: 'example' });
 
-      // Something outside ccrcd killed the tmux session.
+      // Something outside ccrcd killed the tmux session, and the launch window the
+      // record is granted has long since passed.
       harnessed.adapter.liveNames = [];
+      harnessed.at(1_764_000_600_000);
 
       const listing = (await (await harnessed.app.request('/sessions')).json()) as {
         sessions: Record<string, unknown>[];
@@ -470,6 +537,56 @@ describe('concurrency', () => {
         pid: 4242,
         status: 'stopped',
       });
+    });
+  });
+
+  test('a stop that completes before a launch settles is never undone by it', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.hostSessions = [
+        hostSession({ cwd: '/repos/example', pid: 4242, startedAt: 1_764_000_000_000 }),
+      ];
+
+      // Hold the launch just before it settles.
+      const settling = Promise.withResolvers<void>();
+      harnessed.adapter.listDelay = () => settling.promise;
+      const launch = postSession(harnessed, { repo: 'example' });
+      await Bun.sleep(1);
+      harnessed.adapter.listDelay = () => Promise.resolve();
+
+      // The stop runs to completion first: tmux is killed and the record is stopped.
+      expect((await harnessed.app.request('/sessions/id1', { method: 'DELETE' })).status).toBe(200);
+      settling.resolve();
+      await launch;
+
+      // The settle may not resurrect the record: the tmux session is already dead,
+      // so a `running` record here is a phantom nothing can stop.
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ endedAt: 1_764_000_000_000, status: 'stopped' });
+      const listed = (await (await harnessed.app.request('/sessions/id1')).json()) as Record<
+        string,
+        unknown
+      >;
+      expect(listed.status).toBe('stopped');
+    });
+  });
+
+  test('a launch that fails after a stop leaves the stop standing', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.attachUrl = new LaunchError('no attach URL appeared');
+
+      const settling = Promise.withResolvers<void>();
+      harnessed.adapter.stopDelay = () => settling.promise;
+      const launch = postSession(harnessed, { repo: 'example' });
+      await Bun.sleep(1);
+      const deleted = harnessed.app.request('/sessions/id1', { method: 'DELETE' });
+      await Bun.sleep(1);
+      settling.resolve();
+      await Promise.all([launch, deleted]);
+
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ endedAt: 1_764_000_000_000, status: 'stopped' });
     });
   });
 
