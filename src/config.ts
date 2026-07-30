@@ -191,24 +191,41 @@ const readAllowedOrigins = (value: unknown): readonly string[] => {
 const SUPERVISION_AT = 'config: [supervision]';
 
 /**
- * A zero or negative interval would busy-loop the supervisor, and a zero threshold
- * would call every busy session hung, so every duration has to be positive.
+ * Every supervision duration is a whole number of its own unit inside a range that
+ * keeps the loop sane. Both ends matter:
+ *
+ * - a fraction is not a rounding nuisance but a behaviour change — a hang threshold
+ *   of `0.00001` minutes calls every busy session hung on the next tick;
+ * - past 2^31-1 milliseconds a timer interval wraps and fires continuously, so an
+ *   interval an operator meant as "basically never" becomes a tick storm.
  */
 const readDuration = (
   source: Record<string, unknown>,
   key: string,
   unitMs: number,
   fallback: number,
+  range: { readonly min: number; readonly max: number },
 ): number => {
   const value = source[key];
   if (value === undefined) {
     return fallback;
   }
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    throw new ConfigError(`${SUPERVISION_AT}: "${key}" must be a positive number`);
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new ConfigError(`${SUPERVISION_AT}: "${key}" must be a whole number of its own unit`);
+  }
+  if (value < range.min || value > range.max) {
+    throw new ConfigError(
+      `${SUPERVISION_AT}: "${key}" must be between ${range.min} and ${range.max}`,
+    );
   }
   return value * unitMs;
 };
+
+/** Frequent enough to be useful, never so frequent that ticks overlap by design. */
+const INTERVAL_SECONDS = { max: 3_600, min: 5 };
+const THRESHOLD_MINUTES = { max: 1_440, min: 1 };
+const WINDOW_MINUTES = { max: 10_080, min: 1 };
+const RETENTION_DAYS = { max: 365, min: 1 };
 
 /** `0` is a legitimate cap: it turns automatic restarts off without turning off detection. */
 const readRestartCap = (value: unknown): number => {
@@ -230,18 +247,20 @@ const readSupervision = (value: unknown): SupervisionConfig => {
   if (!isRecord(value)) {
     throw new ConfigError('config: "supervision" must be a [supervision] table');
   }
-  return {
+  const supervision: SupervisionConfig = {
     hangThresholdMs: readDuration(
       value,
       'hang_threshold_minutes',
       MINUTE_MS,
       DEFAULT_SUPERVISION.hangThresholdMs,
+      THRESHOLD_MINUTES,
     ),
     intervalMs: readDuration(
       value,
       'reconcile_interval_seconds',
       SECOND_MS,
       DEFAULT_SUPERVISION.intervalMs,
+      INTERVAL_SECONDS,
     ),
     restartCap: readRestartCap(value.restart_cap),
     restartCapWindowMs: readDuration(
@@ -249,14 +268,32 @@ const readSupervision = (value: unknown): SupervisionConfig => {
       'restart_cap_window_minutes',
       MINUTE_MS,
       DEFAULT_SUPERVISION.restartCapWindowMs,
+      WINDOW_MINUTES,
     ),
     stoppedRetentionMs: readDuration(
       value,
       'stopped_retention_days',
       DAY_MS,
       DEFAULT_SUPERVISION.stoppedRetentionMs,
+      RETENTION_DAYS,
     ),
   };
+  // A window shorter than the threshold could never hold two restarts of the same
+  // session, which reads as a cap the operator did not ask for.
+  if (supervision.restartCapWindowMs < supervision.hangThresholdMs) {
+    throw new ConfigError(
+      `${SUPERVISION_AT}: "restart_cap_window_minutes" must be at least "hang_threshold_minutes"`,
+    );
+  }
+  // Restart history lives on records, and pruned records take their history with
+  // them: retention that expires inside the window would reset the restart count
+  // and let a repo that wedges every session be restarted forever.
+  if (supervision.stoppedRetentionMs < supervision.restartCapWindowMs) {
+    throw new ConfigError(
+      `${SUPERVISION_AT}: "stopped_retention_days" must cover "restart_cap_window_minutes", or pruning would drop the history the restart cap is counted from`,
+    );
+  }
+  return supervision;
 };
 
 export const parseConfig = (source: string, configPath: string, home: string): Config => {

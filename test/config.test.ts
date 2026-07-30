@@ -208,7 +208,7 @@ reconcile_interval_seconds = 5
 hang_threshold_minutes = 2
 restart_cap = 1
 restart_cap_window_minutes = 15
-stopped_retention_days = 0.5
+stopped_retention_days = 2
 `;
 
     await withConfig(toml, async (configPath) => {
@@ -219,7 +219,7 @@ stopped_retention_days = 0.5
         intervalMs: 5_000,
         restartCap: 1,
         restartCapWindowMs: 900_000,
-        stoppedRetentionMs: 43_200_000,
+        stoppedRetentionMs: 172_800_000,
       });
     });
   });
@@ -250,13 +250,53 @@ stopped_retention_days = 0.5
     'restart_cap_window_minutes = -5',
     'stopped_retention_days = 0',
     'stopped_retention_days = "seven"',
-  ])('refuses the non-positive duration %s', async (entry) => {
+    // A fraction of a minute would call every busy session hung on the next tick.
+    'hang_threshold_minutes = 0.00001',
+    'reconcile_interval_seconds = 0.5',
+    'stopped_retention_days = 0.5',
+    // Beyond 2^31-1 milliseconds a timer wraps and ticks as fast as it can.
+    'reconcile_interval_seconds = 2147484',
+    'reconcile_interval_seconds = 4',
+    'hang_threshold_minutes = 10000',
+    'stopped_retention_days = 4000',
+    'restart_cap_window_minutes = 100000',
+  ])('refuses the unusable duration %s', async (entry) => {
     await withConfig(`[supervision]\n${entry}\n`, async (configPath) => {
       const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
 
       expect(failure).toBeInstanceOf(ConfigError);
       expect(failure.message).toContain('[supervision]');
-      expect(failure.message).toMatch(/must be a positive number/);
+      expect(failure.message).toMatch(/whole number of|between/);
+    });
+  });
+
+  test('refuses a restart window shorter than the hang threshold', async () => {
+    const toml = `[supervision]
+hang_threshold_minutes = 30
+restart_cap_window_minutes = 10
+`;
+
+    await withConfig(toml, async (configPath) => {
+      const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+      expect(failure).toBeInstanceOf(ConfigError);
+      expect(failure.message).toMatch(/"restart_cap_window_minutes" must be at least/);
+    });
+  });
+
+  test('refuses a retention shorter than the restart window', async () => {
+    // Retention that expires inside the window would drop the very history the
+    // restart cap is counted from.
+    const toml = `[supervision]
+restart_cap_window_minutes = 2880
+stopped_retention_days = 1
+`;
+
+    await withConfig(toml, async (configPath) => {
+      const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+      expect(failure).toBeInstanceOf(ConfigError);
+      expect(failure.message).toMatch(/"stopped_retention_days" must cover/);
     });
   });
 
