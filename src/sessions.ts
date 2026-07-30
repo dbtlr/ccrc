@@ -549,12 +549,27 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     pid: killed?.pid ?? record.pid,
   });
 
-  /** The host entry a record is running as, as far as the fleet listing can say. */
-  const hostEntryOf = async (
+  /**
+   * The host entry a record is running as, as far as the fleet listing can say.
+   *
+   * A CLI that will not answer costs the claim, nothing more. Stopping a session is the
+   * one operation that has to work when the host is misbehaving — a wedged `claude`
+   * would otherwise fail the `DELETE`, leave the tmux session running, and leave the
+   * record claiming to be alive, which is the opposite of what the caller asked for.
+   */
+  const hostEntryOrNothing = async (
     record: SessionRecord,
     records: readonly SessionRecord[],
-  ): Promise<HostSession | undefined> =>
-    correlate(record, await adapter.listHostSessions(), records);
+  ): Promise<HostSession | undefined> => {
+    try {
+      return correlate(record, await adapter.listHostSessions(), records);
+    } catch (cause) {
+      logger.error(
+        `ccrcd could not read the host fleet while stopping session ${record.id}, so its host entry was not claimed: ${messageOf(cause)}`,
+      );
+      return undefined;
+    }
+  };
 
   /**
    * The record is only marked stopped once tmux confirms the session is gone; a
@@ -573,7 +588,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
     // Read before the kill: afterwards the entry starts disappearing from the fleet
     // listing, and an unclaimed entry is one the next launch can adopt.
-    const killed = await hostEntryOf(target, stored);
+    const killed = await hostEntryOrNothing(target, stored);
     await adapter.stopSession(target.tmuxName);
     const stopped = await store.update((records) => {
       const current = records.find((record) => record.id === id);

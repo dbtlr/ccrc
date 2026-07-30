@@ -139,6 +139,8 @@ export type FakeAdapter = ClaudeAdapter & {
   claudeHealthFailure: Error | null;
   /** Awaited before every `listHostSessions`, to interleave requests on purpose. */
   listDelay: () => Promise<void>;
+  /** Set when the claude CLI cannot be asked for the host fleet at all. */
+  listFailure: Error | null;
   /** Awaited before every `stopSession`, to interleave requests on purpose. */
   stopDelay: () => Promise<void>;
 };
@@ -183,8 +185,12 @@ export const fakeAdapter = (): FakeAdapter => {
     },
     launches,
     listDelay: () => Promise.resolve(),
+    listFailure: null,
     listHostSessions: async () => {
       await adapter.listDelay();
+      if (adapter.listFailure !== null) {
+        throw adapter.listFailure;
+      }
       return adapter.hostSessions;
     },
     liveFailure: null,

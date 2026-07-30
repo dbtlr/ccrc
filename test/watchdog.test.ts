@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { WORST_CASE_LAUNCH_MS } from '../src/adapter/claude.ts';
 import type { HostSession } from '../src/adapter/claude.ts';
 import { loadConfig, stateFilePath } from '../src/config.ts';
-import { StopError } from '../src/errors.ts';
+import { CommandTimeoutError, StopError } from '../src/errors.ts';
 import { LAUNCH_GRACE_MS, createSessionService } from '../src/sessions.ts';
 import type { HangOutcome, SessionService, SessionView } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
@@ -426,6 +426,29 @@ describe('hang watchdog', () => {
       const stored = await harnessed.store.load();
       expect(byId(stored, 'id1')?.pid).toBe(4242);
       expect(byId(stored, 'id1')?.hostSessionId).toBe('sid-1');
+    });
+  });
+
+  test('stops a session even when the claude CLI will not answer', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [hung({ id: 'id1', pid: null })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      // A wedged or missing CLI: the fleet listing is where the host claim comes from,
+      // but stopping a session is the one thing that has to work when things are broken.
+      harnessed.adapter.listFailure = new CommandTimeoutError(
+        'claude did not finish within 30000ms and was killed',
+      );
+
+      const stopped = await harnessed.service.stop('id1');
+
+      expect(stopped.status).toBe('stopped');
+      expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
+      const stored = await harnessed.store.load();
+      expect(stored[0]?.status).toBe('stopped');
+      expect(stored[0]?.endedAt).toBe(NOW);
+      // No claim to stamp, and none invented.
+      expect(stored[0]?.pid).toBeNull();
+      expect(stored[0]?.hostSessionId).toBeNull();
     });
   });
 
