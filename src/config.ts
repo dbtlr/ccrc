@@ -73,12 +73,31 @@ const readPort = (value: unknown): number => {
   return value;
 };
 
+const LOOPBACK_HOSTS = new Set(['localhost', '::1', '[::1]', '::ffff:127.0.0.1']);
+const LOOPBACK_IPV4 = /^127(?:\.\d{1,3}){3}$/;
+
+const isLoopback = (host: string): boolean => {
+  const normalized = host.toLowerCase();
+  return LOOPBACK_HOSTS.has(normalized) || LOOPBACK_IPV4.test(normalized);
+};
+
+/**
+ * ccrcd has no authentication and every session it starts runs with
+ * `bypassPermissions`, so a reachable-from-the-network bind publishes arbitrary
+ * code execution. Until that is fronted by an authenticated transport, a
+ * non-loopback bind is a fatal config error rather than a silent exposure.
+ */
 const readBind = (value: unknown): string => {
   if (value === undefined) {
     return DEFAULT_BIND;
   }
   if (typeof value !== 'string' || value.length === 0) {
     throw new ConfigError('config: "bind" must be a non-empty string');
+  }
+  if (!isLoopback(value)) {
+    throw new ConfigError(
+      `config: "bind" must be a loopback address (127.0.0.1, ::1, or localhost), not "${value}". ccrcd has no authentication and every session it launches runs with bypassPermissions, so any other bind offers arbitrary code execution to the network.`,
+    );
   }
   return value;
 };

@@ -17,6 +17,13 @@ name = "notes"
 path = "~/notes"
 `;
 
+const withBind = async (bind: string, run: (configPath: string) => Promise<void>): Promise<void> =>
+  withTempDir(async (dir) => {
+    const configPath = join(dir, 'config.toml');
+    await Bun.write(configPath, `bind = "${bind}"\n`);
+    await run(configPath);
+  });
+
 describe('loadConfig', () => {
   test('reads bind, port, and the repo registry from CCRC_CONFIG', async () => {
     await withTempDir(async (dir) => {
@@ -73,6 +80,28 @@ describe('loadConfig', () => {
       expect(badRepo.message).toMatch(/repos\[0]: "path" must be a non-empty string/);
     });
   });
+
+  test.each(['0.0.0.0', '::', '192.168.1.10', 'ccrc.example.ts.net'])(
+    'refuses the network-reachable bind %s',
+    async (bind) => {
+      await withBind(bind, async (configPath) => {
+        const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+        expect(failure).toBeInstanceOf(ConfigError);
+        expect(failure.message).toMatch(/must be a loopback address/);
+        expect(failure.message).toMatch(/bypassPermissions/);
+      });
+    },
+  );
+
+  test.each(['127.0.0.1', '127.0.0.2', 'localhost', '::1', '[::1]'])(
+    'accepts the loopback bind %s',
+    async (bind) => {
+      await withBind(bind, async (configPath) => {
+        const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+        expect(config.bind).toBe(bind);
+      });
+    },
+  );
 
   test('falls back to the XDG-style path when CCRC_CONFIG is unset', () => {
     expect(configPathFrom({}, '/home/tester')).toBe('/home/tester/.config/ccrc/config.toml');

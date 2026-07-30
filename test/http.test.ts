@@ -58,6 +58,14 @@ const postSession = async (harnessed: Harness, body: unknown): Promise<Response>
     method: 'POST',
   });
 
+/** A launch request with caller-chosen headers — the CSRF surface. */
+const bodyOnly = async (harnessed: Harness, headers: Record<string, string>): Promise<Response> =>
+  harnessed.app.request('/sessions', {
+    body: JSON.stringify({ repo: 'example' }),
+    headers,
+    method: 'POST',
+  });
+
 beforeEach(() => {
   sequence = 0;
 });
@@ -203,6 +211,24 @@ describe('session lifecycle', () => {
     });
   });
 
+  test('an unexpected failure is a generic 500 that leaks nothing', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.attachUrl = new TypeError(
+        'Invalid argument: claude --permission-mode bypassPermissions /Users/someone/secret',
+      );
+
+      const response = await postSession(harnessed, { repo: 'example' });
+
+      expect(response.status).toBe(500);
+      expect((await response.json()) as Record<string, unknown>).toEqual({
+        error: 'internal error',
+      });
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ status: 'failed' });
+    });
+  });
+
   test('a kill tmux refused leaves the record active and answers 502', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
@@ -279,6 +305,177 @@ describe('concurrency', () => {
       expect(persisted.length).toBe(3);
       expect(new Set(persisted.map((record) => record.tmuxName)).size).toBe(3);
       expect(persisted.every((record) => record.status === 'running')).toBe(true);
+    });
+  });
+});
+
+describe('cross-origin defence', () => {
+  test('a body not declared as JSON is a 415', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      // The content types a cross-origin page can set without a preflight.
+      expect((await bodyOnly(harnessed, { 'content-type': 'text/plain' })).status).toBe(415);
+      expect(
+        (await bodyOnly(harnessed, { 'content-type': 'application/x-www-form-urlencoded' })).status,
+      ).toBe(415);
+      expect((await bodyOnly(harnessed, { 'content-type': 'multipart/form-data' })).status).toBe(
+        415,
+      );
+      expect((await bodyOnly(harnessed, {})).status).toBe(415);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('a charset parameter on application/json is still accepted', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'Application/JSON; charset=utf-8',
+      });
+
+      expect(response.status).toBe(201);
+    });
+  });
+
+  test('a cross-origin or cross-site mutation is a 403', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const foreignOrigin = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin: 'https://evil.example',
+      });
+      expect(foreignOrigin.status).toBe(403);
+
+      const crossSite = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        'sec-fetch-site': 'cross-site',
+      });
+      expect(crossSite.status).toBe(403);
+
+      const foreignDelete = await harnessed.app.request('/sessions/id1', {
+        headers: { origin: 'https://evil.example' },
+        method: 'DELETE',
+      });
+      expect(foreignDelete.status).toBe(403);
+
+      expect(harnessed.adapter.launches).toEqual([]);
+      expect(harnessed.adapter.stopped).toEqual([]);
+    });
+  });
+
+  test('a same-origin request and a header-less CLI request are allowed', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const sameOrigin = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin: 'http://localhost',
+        'sec-fetch-site': 'same-origin',
+      });
+      expect(sameOrigin.status).toBe(201);
+
+      const deleted = await harnessed.app.request('/sessions/id1', { method: 'DELETE' });
+      expect(deleted.status).toBe(200);
+    });
+  });
+
+  test('reads are unaffected', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await harnessed.app.request('/sessions', {
+        headers: { origin: 'https://evil.example' },
+      });
+
+      expect(response.status).toBe(200);
+    });
+  });
+});
+
+describe('request errors', () => {
+  test('unknown repo is a 404 that does not enumerate the registry', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await postSession(harnessed, { repo: 'nope' });
+
+      expect(response.status).toBe(404);
+      const { error } = (await response.json()) as { error: string };
+      expect(error).toBe('unknown repo "nope"');
+      expect(error).not.toContain('Side Project');
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('an unusable prompt is a 400, not an exec failure', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const withNul = await postSession(harnessed, { prompt: 'ok\0bad', repo: 'example' });
+      expect(withNul.status).toBe(400);
+      expect(((await withNul.json()) as { error: string }).error).toMatch(/NUL/);
+
+      const oversized = await postSession(harnessed, {
+        prompt: 'x'.repeat(32_769),
+        repo: 'example',
+      });
+      expect(oversized.status).toBe(400);
+      expect(((await oversized.json()) as { error: string }).error).toMatch(/at most 32768/);
+
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('a repo path that cannot be resolved is a 4xx naming the repo, not the path', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.trustFailure = Object.assign(
+        new Error("ENOENT: no such file or directory, realpath '/repos/example'"),
+        { code: 'ENOENT' },
+      );
+
+      const response = await postSession(harnessed, { repo: 'example' });
+
+      expect(response.status).toBe(400);
+      const { error } = (await response.json()) as { error: string };
+      expect(error).toContain('repo "example"');
+      expect(error).not.toContain('/repos/example');
+      const persisted = await Bun.file(harnessed.statePath).exists();
+      expect(persisted).toBe(false);
+    });
+  });
+
+  test('a missing or wrong-typed repo field is a 400', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      expect((await postSession(harnessed, {})).status).toBe(400);
+      expect((await postSession(harnessed, { repo: 7 })).status).toBe(400);
+      expect((await postSession(harnessed, { prompt: 7, repo: 'example' })).status).toBe(400);
+      expect(
+        (
+          await harnessed.app.request('/sessions', {
+            body: 'not json',
+            headers: { 'content-type': 'application/json' },
+            method: 'POST',
+          })
+        ).status,
+      ).toBe(400);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('unknown session ids are 404 on both read and delete', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      expect((await harnessed.app.request('/sessions/absent')).status).toBe(404);
+      expect((await harnessed.app.request('/sessions/absent', { method: 'DELETE' })).status).toBe(
+        404,
+      );
     });
   });
 });
