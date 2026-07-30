@@ -673,6 +673,52 @@ describe('hang watchdog', () => {
     });
   });
 
+  test('keeps the cross-link when a DELETE lands between the kill and the replacement', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [busySession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
+
+      /**
+       * Park the replacement's own fleet reading, which happens after its record
+       * exists and after the hung record has been retired once — the window in which
+       * an operator's DELETE can land. Only that reading parks: the DELETE takes one
+       * of its own, and parking it too would deadlock rather than test anything.
+       */
+      const launching = Promise.withResolvers<void>();
+      const parked = Promise.withResolvers<void>();
+      let reads = 0;
+      harnessed.adapter.listDelay = () => {
+        reads += 1;
+        if (reads !== 2) {
+          return Promise.resolve();
+        }
+        parked.resolve();
+        return launching.promise;
+      };
+
+      const sweeping = sweepHung(harnessed);
+      await parked.promise;
+      await harnessed.service.stop('id1');
+      launching.resolve();
+      const outcomes = await sweeping;
+
+      const stored = await harnessed.store.load();
+      const old = byId(stored, 'id1');
+      // The operator's account of why it ended stands...
+      expect(old?.status).toBe('stopped');
+      expect(old?.stopReason).toBeNull();
+      expect(old?.endedAt).toBe(NOW);
+      // ...but where the session went is bookkeeping, not attribution, and a record
+      // whose replacement points back at it has to point forward in return.
+      expect(old?.restartedAs).toBe('new1');
+      expect(byId(stored, 'new1')?.restartedFrom).toBe('id1');
+      expect(byId(stored, 'new1')?.status).toBe('running');
+      expect(outcomes[0]?.restartedAs).toBe('new1');
+    });
+  });
+
   test('retires the record when the replacement cannot be started', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, [hung({ id: 'id1' })]);
@@ -1022,18 +1068,22 @@ describe('idle timeout', () => {
       harnessed.adapter.hostSessions = [idleSession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 35 * MINUTE };
       // The sweep's own kill parks; the DELETE that arrives behind it does not.
+      // Gated on the sweep actually reaching its kill — a timer could let the
+      // DELETE arrive first and take the parked branch itself.
       const killing = Promise.withResolvers<void>();
+      const parked = Promise.withResolvers<void>();
       let first = true;
       harnessed.adapter.stopDelay = () => {
         if (!first) {
           return Promise.resolve();
         }
         first = false;
+        parked.resolve();
         return killing.promise;
       };
 
       const sweeping = sweepIdle(harnessed);
-      await Bun.sleep(1);
+      await parked.promise;
       await harnessed.service.stop('id1');
       killing.resolve();
       await sweeping;

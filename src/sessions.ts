@@ -732,7 +732,17 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         return { records, result: undefined };
       }
       if (TERMINAL_STATUSES.has(current.status) && current.stopReason === null) {
-        return { records, result: undefined };
+        // Something else ended this record and owns the account of why. The restart
+        // cross-link is not attribution, though: without it the replacement would
+        // point back at a record that never says where the session went.
+        if (restartedAs === null || current.restartedAs === restartedAs) {
+          return { records, result: undefined };
+        }
+        const linked: SessionRecord = { ...current, restartedAs };
+        return {
+          records: records.map((record) => (record.id === id ? linked : record)),
+          result: undefined,
+        };
       }
       const next: SessionRecord = {
         ...current,
