@@ -11,6 +11,15 @@ import { join, resolve, sep } from 'node:path';
 
 const INDEX_FILE = 'index.html';
 const ASSET_PREFIX = '/assets/';
+const ASSET_DIR = '/assets';
+
+/**
+ * `/assets` without the trailing slash names the same directory as `/assets/`, and
+ * neither is a servable file, so both must fail the same way — otherwise one 404s
+ * and the other falls back to the shell for no reason a caller can see.
+ */
+const isAssetPath = (pathname: string): boolean =>
+  pathname === ASSET_DIR || pathname.startsWith(ASSET_PREFIX);
 
 /** Vite fingerprints everything under `/assets/`, so those may be cached forever. */
 const ASSET_CACHE_CONTROL = 'public, max-age=31536000, immutable';
@@ -75,7 +84,12 @@ export const createUiServer = (uiDir: string): UiServer => {
     if (path === undefined) {
       return shell();
     }
-    const asset = await fileResponse(path, ASSET_CACHE_CONTROL);
+    // The cache lifetime comes from the request path, not from whether a file
+    // happens to exist there: a bookmarked `/index.html` must never inherit the
+    // year-long cache meant for fingerprinted assets, or a later rebuild leaves it
+    // permanently pointed at a bundle that is gone.
+    const isAsset = isAssetPath(pathname);
+    const asset = await fileResponse(path, isAsset ? ASSET_CACHE_CONTROL : SHELL_CACHE_CONTROL);
     if (asset !== undefined) {
       return asset;
     }
@@ -84,7 +98,7 @@ export const createUiServer = (uiDir: string): UiServer => {
      * that no longer exists. Answering with HTML would make that a mystifying MIME
      * error in the console, so it is a plain `404`.
      */
-    if (pathname.startsWith(ASSET_PREFIX)) {
+    if (isAsset) {
       return new Response('not found\n', {
         headers: { 'content-type': 'text/plain; charset=utf-8' },
         status: 404,

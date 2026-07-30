@@ -75,6 +75,32 @@ describe('serving the console', () => {
     });
   });
 
+  // A bookmarked shell must not inherit the year-long cache meant for `/assets/*`:
+  // that would leave a rebuild permanently blank until the cache is purged by hand.
+  test('a bookmarked /index.html is served no-cache, not the asset cache lifetime', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const response = await app.request('/index.html');
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('cache-control')).toBe('no-cache');
+    });
+  });
+
+  test('GET /assets and /assets/ fail the same way', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const withoutSlash = await app.request('/assets');
+      const withSlash = await app.request('/assets/');
+
+      expect(withoutSlash.status).toBe(404);
+      expect(withSlash.status).toBe(404);
+      expect(withoutSlash.headers.get('content-type')).toBe(withSlash.headers.get('content-type'));
+    });
+  });
+
   // A deep link typed into Safari has to reach the router, not a 404.
   test.each(['/board', '/sessions-view/deep/link', '/repos-picker'])(
     'falls back to the shell for the client-side route %s',
