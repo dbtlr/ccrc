@@ -489,6 +489,32 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   };
 
   /**
+   * What the record keeps of the session that was just killed.
+   *
+   * Every path that kills a session goes through this, because the claim is what
+   * stops the next session in the same repo from adopting the dead one's entry:
+   * `claude agents --json` still lists a killed session for a while, and a record
+   * that adopted it would report a stranger's activity and be killed by the watchdog
+   * on a stranger's stale transcript. An operator's `DELETE` needs it exactly as much
+   * as the watchdog's kill does — stop, then relaunch, is the ordinary workflow.
+   */
+  const claimOf = (
+    record: SessionRecord,
+    killed: HostSession | undefined,
+  ): Pick<SessionRecord, 'endedAt' | 'hostSessionId' | 'pid'> => ({
+    endedAt: now(),
+    hostSessionId: killed?.sessionId ?? record.hostSessionId,
+    pid: killed?.pid ?? record.pid,
+  });
+
+  /** The host entry a record is running as, as far as the fleet listing can say. */
+  const hostEntryOf = async (
+    record: SessionRecord,
+    records: readonly SessionRecord[],
+  ): Promise<HostSession | undefined> =>
+    correlate(record, await adapter.listHostSessions(), records);
+
+  /**
    * The record is only marked stopped once tmux confirms the session is gone; a
    * refused kill propagates so the record stays active and reconcilable.
    *
@@ -503,6 +529,9 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     if (target === undefined) {
       throw new NotFoundError(`unknown session "${id}"`);
     }
+    // Read before the kill: afterwards the entry starts disappearing from the fleet
+    // listing, and an unclaimed entry is one the next launch can adopt.
+    const killed = await hostEntryOf(target, stored);
     await adapter.stopSession(target.tmuxName);
     const stopped = await store.update((records) => {
       const current = records.find((record) => record.id === id);
@@ -513,7 +542,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       // left over from an earlier ccrcd decision would be the wrong one.
       const next: SessionRecord = {
         ...current,
-        endedAt: now(),
+        ...claimOf(current, killed),
         status: 'stopped',
         stopReason: null,
       };
@@ -525,13 +554,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { ...withoutRepoPath(stopped), activity: 'unknown' };
   };
 
-  /**
-   * Retires a record ccrcd decided to end, with the reason it decided that.
-   *
-   * `killed` carries the host entry the session was killed with. Persisting it is
-   * what stops the replacement from adopting the dead session's entry: a retired
-   * record claims those identifiers for as long as it is kept.
-   */
+  /** Retires a record ccrcd decided to end, with the reason it decided that. */
   const retire = (
     id: string,
     reason: string,
@@ -545,9 +568,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       }
       const next: SessionRecord = {
         ...current,
-        endedAt: now(),
-        hostSessionId: killed?.sessionId ?? current.hostSessionId,
-        pid: killed?.pid ?? current.pid,
+        ...claimOf(current, killed),
         restartedAs,
         status: 'stopped',
         stopReason: reason,

@@ -287,6 +287,32 @@ describe('hang watchdog', () => {
     });
   });
 
+  test('never lets a session launched after a DELETE adopt the stopped session’s entry', async () => {
+    await withTempDir(async (dir) => {
+      // The ordinary operator workflow for a session that has gone quiet: stop it,
+      // start another one in the same repo. The stopped session's entry is still in
+      // the CLI's fleet listing, still busy, with a transcript that stopped moving.
+      const harnessed = await harness(dir, [hung({ id: 'id1', pid: null })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [busySession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
+
+      await harnessed.service.stop('id1');
+      const replacement = await harnessed.service.launch({ repo: 'example' });
+
+      expect(replacement.pid).toBeNull();
+      expect(replacement.hostSessionId).toBeNull();
+      // Adopting the dead entry would have the watchdog kill this healthy session,
+      // and would leave it reporting a stranger's activity until then.
+      expect(await harnessed.service.sweepHung()).toEqual([]);
+      expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
+      expect(harnessed.adapter.launches).toHaveLength(1);
+      const stored = await harnessed.store.load();
+      expect(byId(stored, 'id1')?.pid).toBe(4242);
+      expect(byId(stored, 'id1')?.hostSessionId).toBe('sid-1');
+    });
+  });
+
   test('leaves the record active when tmux refuses the kill', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, [hung({ id: 'id1' })]);
