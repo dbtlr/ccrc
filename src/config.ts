@@ -23,6 +23,12 @@ export type SupervisionConfig = {
   readonly restartCapWindowMs: number;
   /** How long a stopped or failed record is kept before it is pruned. */
   readonly stoppedRetentionMs: number;
+  /**
+   * How long an idle session may sit with nothing happening before ccrcd stops it,
+   * or `null` when the operator has not asked for that at all. Unset is off: a
+   * session nobody is watching is not a problem until someone says it is.
+   */
+  readonly idleTimeoutMs: number | null;
 };
 
 export type Config = {
@@ -53,6 +59,7 @@ const DAY_MS = 24 * 60 * MINUTE_MS;
 
 export const DEFAULT_SUPERVISION: SupervisionConfig = {
   hangThresholdMs: 10 * MINUTE_MS,
+  idleTimeoutMs: null,
   intervalMs: 30 * SECOND_MS,
   restartCap: 3,
   restartCapWindowMs: 60 * MINUTE_MS,
@@ -254,11 +261,26 @@ const readDuration = (
   return value * unitMs;
 };
 
+/**
+ * A key with no default at all: absent means the feature is off, which is a
+ * different answer from any number. Everything else about it — whole numbers, a
+ * bounded range — is what the rest of the table is held to.
+ */
+const readOptionalDuration = (
+  source: Record<string, unknown>,
+  key: string,
+  unitMs: number,
+  range: { readonly min: number; readonly max: number },
+): number | null =>
+  source[key] === undefined ? null : readDuration(source, key, unitMs, 0, range);
+
 /** Frequent enough to be useful, never so frequent that ticks overlap by design. */
 const INTERVAL_SECONDS = { max: 3_600, min: 5 };
 const THRESHOLD_MINUTES = { max: 1_440, min: 1 };
 const WINDOW_MINUTES = { max: 10_080, min: 1 };
 const RETENTION_DAYS = { max: 365, min: 1 };
+/** Long enough that a pause for coffee is not a stop; short of a working week. */
+const IDLE_MINUTES = { max: 10_080, min: 5 };
 
 /** `0` is a legitimate cap: it turns automatic restarts off without turning off detection. */
 const readRestartCap = (value: unknown): number => {
@@ -288,6 +310,7 @@ const readSupervision = (value: unknown): SupervisionConfig => {
       DEFAULT_SUPERVISION.hangThresholdMs,
       THRESHOLD_MINUTES,
     ),
+    idleTimeoutMs: readOptionalDuration(value, 'idle_timeout_minutes', MINUTE_MS, IDLE_MINUTES),
     intervalMs: readDuration(
       value,
       'reconcile_interval_seconds',
