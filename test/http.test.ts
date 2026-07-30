@@ -59,7 +59,7 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
   const log = capturingLogger();
   let current = 1_764_000_000_000;
   const git = recordingRunner(() => ok());
-  const workspaceAdapter = createWorkspaceAdapter({ run: git.run });
+  const workspaceAdapter = createWorkspaceAdapter({ logger: log.logger, run: git.run });
   const registry = createRepoRegistry({ adapter: workspaceAdapter, config, logger: log.logger });
   const service = createSessionService({
     adapter,

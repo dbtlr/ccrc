@@ -1,6 +1,8 @@
 import { mkdir, readdir, realpath, rm, stat } from 'node:fs/promises';
 
 import { WorkspaceError } from '../errors.ts';
+import { createLogger } from '../log.ts';
+import type { Logger } from '../log.ts';
 import { createBunCommandRunner } from './claude.ts';
 import type { CommandRunner } from './claude.ts';
 
@@ -32,6 +34,7 @@ export type WorkspaceAdapter = {
 export type WorkspaceAdapterOptions = {
   readonly run?: CommandRunner;
   readonly commandTimeoutMs?: number;
+  readonly logger?: Logger;
 };
 
 /**
@@ -57,9 +60,13 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const errorCode = (cause: unknown): string | undefined =>
   isRecord(cause) && typeof cause.code === 'string' ? cause.code : undefined;
 
-/** The tail of whatever the command said, or its exit code — never its argv. */
+/**
+ * What went wrong, for the log alone. git quotes host paths, remotes, and its own
+ * command line into stderr, and the caller's failure is served to an HTTP client —
+ * so the client is told which step failed and the log is told why.
+ */
 const failureOf = (stderr: string, exitCode: number): string =>
-  stderr.trim().split('\n').slice(-2).join(' / ') || `exit code ${exitCode}`;
+  stderr.trim().split('\n').slice(-3).join(' / ') || `exit code ${exitCode}`;
 
 /**
  * Only real directories count, and only the ones directly under the root.
@@ -149,13 +156,15 @@ const removeIfPristine = async (path: string): Promise<boolean> => {
 
 export const createWorkspaceAdapter = (options: WorkspaceAdapterOptions = {}): WorkspaceAdapter => {
   const run = options.run ?? createBunCommandRunner(options.commandTimeoutMs);
+  const logger = options.logger ?? createLogger();
 
   const initRepo = async (path: string): Promise<void> => {
     const initialised = await run(['git', '-C', path, 'init', '-q']);
     if (initialised.exitCode !== 0) {
-      throw new WorkspaceError(
-        `git could not initialise the workspace: ${failureOf(initialised.stderr, initialised.exitCode)}`,
+      logger.error(
+        `ccrcd could not git-init ${path}: ${failureOf(initialised.stderr, initialised.exitCode)}`,
       );
+      throw new WorkspaceError('git could not initialise the workspace');
     }
     const committed = await run([
       'git',
@@ -169,9 +178,10 @@ export const createWorkspaceAdapter = (options: WorkspaceAdapterOptions = {}): W
       INITIAL_COMMIT_MESSAGE,
     ]);
     if (committed.exitCode !== 0) {
-      throw new WorkspaceError(
-        `git could not make the first commit: ${failureOf(committed.stderr, committed.exitCode)}`,
+      logger.error(
+        `ccrcd could not make the first commit in ${path}: ${failureOf(committed.stderr, committed.exitCode)}`,
       );
+      throw new WorkspaceError('git could not make the first commit in the workspace');
     }
   };
 

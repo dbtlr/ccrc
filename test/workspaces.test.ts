@@ -43,11 +43,12 @@ const harness = async (
       ? failed('fatal: could not create leading directories')
       : ok(),
   );
+  const log = capturingLogger();
   return {
-    adapter: createWorkspaceAdapter({ run: recording.run }),
+    adapter: createWorkspaceAdapter({ logger: log.logger, run: recording.run }),
     config,
     gitCalls: () => recording.calls,
-    log: capturingLogger(),
+    log,
     root,
   };
 };
@@ -354,6 +355,25 @@ describe('workspace creation', () => {
       expect(failure.message).toMatch(/inside the workspaces root/);
       expect(removed).toEqual([join(dir, 'outside', 'escaped')]);
       expect(harnessed.gitCalls()).toEqual([]);
+    });
+  });
+
+  test('keeps git output out of the response and puts it in the log', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, { git: 'init-fails' });
+      const service = createWorkspaceService({
+        adapter: harnessed.adapter,
+        config: harnessed.config,
+        logger: harnessed.log.logger,
+      });
+
+      const failure = await rejection(service.create('doomed'));
+
+      // The client is told what failed, never where or how: git quotes host paths
+      // and command lines into stderr, and this is the same rule /healthz follows.
+      expect(failure.message).toBe('git could not initialise the workspace');
+      expect(harnessed.log.errors.join('')).toMatch(/could not create leading directories/);
+      expect(harnessed.log.errors.join('')).toMatch(/doomed/);
     });
   });
 

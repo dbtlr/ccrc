@@ -17,7 +17,7 @@ const logger = createLogger();
 const start = async (): Promise<void> => {
   const config = await loadConfig();
   const statePath = stateFilePath(config);
-  const workspaceAdapter = createWorkspaceAdapter();
+  const workspaceAdapter = createWorkspaceAdapter({ logger });
   const registry = createRepoRegistry({ adapter: workspaceAdapter, config, logger });
   const service = createSessionService({
     adapter: createClaudeAdapter(),
