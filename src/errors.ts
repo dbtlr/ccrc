@@ -76,6 +76,22 @@ export class CommandTimeoutError extends CcrcError {
   }
 }
 
+/** A workspace that cannot be created, or a workspaces root that cannot be read. */
+export class WorkspaceError extends CcrcError {
+  constructor(message: string) {
+    super(message, 502);
+    this.name = 'WorkspaceError';
+  }
+}
+
+/** A name that is already taken — by a directory on disk or by a config repo. */
+export class ConflictError extends CcrcError {
+  constructor(message: string) {
+    super(message, 409);
+    this.name = 'ConflictError';
+  }
+}
+
 /** A dependency the daemon needs could not be confirmed by a health probe. */
 export class HealthError extends CcrcError {
   constructor(message: string) {
