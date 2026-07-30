@@ -340,19 +340,60 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       adapter.listHostSessions(),
     ]);
     /**
+     * The host entry a dying record may claim, or nothing.
+     *
+     * A killed session's entry lingers in the fleet listing, and claiming it is what
+     * stops the next session in that repo from adopting it. But the dying record's own
+     * entry may have dropped out of the listing already, and correlation is a cwd-and-
+     * time-window fallback: what it hands back can then be a *live* sibling's entry —
+     * one launched around the same time in the same repo that the CLI has not correlated
+     * yet either. Stamping that would suppress the living session's own correlation for
+     * as long as the dead record is kept: no activity, and no hang coverage, for a
+     * session running with `bypassPermissions`.
+     *
+     * So an entry is only claimed when nothing whose tmux session is still live could
+     * own it. Declining costs a claim; taking it wrongly costs a live session its
+     * supervision.
+     */
+    const claimableEntry = (
+      record: SessionRecord,
+      records: readonly SessionRecord[],
+      snapshot: LivenessSnapshot,
+    ): HostSession | undefined => {
+      const matched = correlate(record, hostSessions, records);
+      if (matched === undefined) {
+        return undefined;
+      }
+      const repoPath = matched.cwd ?? record.repoPath;
+      const contested = records.some(
+        (other) =>
+          other.id !== record.id &&
+          snapshot.names.has(other.tmuxName) &&
+          other.repoPath === repoPath &&
+          // A record that already correlated owns something else; only one with no
+          // identifiers of its own could still turn out to own this entry.
+          other.pid === null &&
+          other.hostSessionId === null &&
+          startedTogether(matched, other),
+      );
+      return contested ? undefined : matched;
+    };
+
+    /**
      * A session that died on its own — crashed, exited, or had its tmux session killed
      * outside ccrcd — is retired here and nowhere else, so this is the only chance to
-     * claim the host entry it leaves behind in the CLI's fleet listing. The listing is
-     * already in hand from the same read, so the claim costs nothing; without it the
-     * next session in that repo can adopt the dead entry, and the watchdog will kill it
-     * on a stranger's stale transcript.
+     * claim the host entry it leaves behind. The listing is already in hand from the
+     * same read, so the claim costs nothing; without it the next session in that repo
+     * can adopt the dead entry, and the watchdog will kill it on a stranger's stale
+     * transcript.
      */
     const retireGone = (
       record: SessionRecord,
       records: readonly SessionRecord[],
+      snapshot: LivenessSnapshot,
     ): SessionRecord => ({
       ...record,
-      ...claimOf(record, correlate(record, hostSessions, records)),
+      ...claimOf(record, claimableEntry(record, records, snapshot)),
       status: 'stopped',
       stopReason: record.stopReason ?? 'its tmux session was gone',
     });
@@ -362,7 +403,9 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         live === undefined
           ? records
           : records.map((record) =>
-              isGone(record, live) ? retireGone(record, records) : promoteIfStranded(record, live),
+              isGone(record, live)
+                ? retireGone(record, records, live)
+                : promoteIfStranded(record, live),
             );
       const changed = reconciled.some((record, index) => record.status !== records[index]?.status);
       return { records: changed ? reconciled : records, result: changed ? reconciled : records };

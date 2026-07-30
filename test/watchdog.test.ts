@@ -197,6 +197,54 @@ describe('reboot reconciliation', () => {
     });
   });
 
+  test('declines to claim an entry a live session in the same repo could own', async () => {
+    await withTempDir(async (dir) => {
+      // Two sessions in one repo, launched 30s apart, neither correlated yet — the CLI
+      // lagged behind both launches, so both records still have a null pid.
+      const started = NOW - 5 * MINUTE;
+      const harnessed = await harness(dir, [
+        sessionRecord({
+          id: 's1',
+          pid: null,
+          startedAt: started,
+          status: 'running',
+          tmuxName: 'ccrc-example-1',
+        }),
+        sessionRecord({
+          id: 's2',
+          pid: null,
+          startedAt: started + 30_000,
+          status: 'running',
+          tmuxName: 'ccrc-example-2',
+        }),
+      ]);
+      // s1's tmux session is gone. s2 is alive and working fine.
+      harnessed.adapter.liveNames = ['ccrc-example-2'];
+      // Only s2's entry is in the fleet listing; s1's has already dropped out of it,
+      // which is what leaves s2's entry as the one thing s1 can correlate to.
+      harnessed.adapter.hostSessions = [
+        hostSession({
+          cwd: '/repos/example',
+          pid: 5_150,
+          sessionId: 'sid-s2',
+          startedAt: started + 30_000,
+          status: 'busy',
+        }),
+      ];
+      harnessed.adapter.transcripts = { 'sid-s2': NOW - 1_000 };
+
+      const listing = await harnessed.service.reconcile();
+
+      const dead = byId(await harnessed.store.load(), 's1');
+      expect(dead?.status).toBe('stopped');
+      // Claiming a living session's entry suppresses that session's own correlation:
+      // no activity and no hang coverage for as long as the dead record is kept.
+      expect(dead?.pid).toBeNull();
+      expect(dead?.hostSessionId).toBeNull();
+      expect(listing.sessions.find((session) => session.id === 's2')?.activity).toBe('busy');
+    });
+  });
+
   test('waits out the launch window before retiring a record tmux has never listed', async () => {
     await withTempDir(async (dir) => {
       // Written seconds ago: tmux may simply not have the session yet.
