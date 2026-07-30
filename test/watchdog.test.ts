@@ -285,6 +285,31 @@ describe('hang watchdog', () => {
     });
   });
 
+  test('records when the session ended, not when the restart finished', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [busySession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
+      // A launch can take the better part of a minute. The clock moves on once the
+      // kill has happened, while the replacement is coming up.
+      let listings = 0;
+      harnessed.adapter.listDelay = () => {
+        listings += 1;
+        if (listings > 1) {
+          harnessed.at(NOW + 55_000);
+        }
+        return Promise.resolve();
+      };
+
+      await harnessed.service.sweepHung();
+
+      // Retention is measured from this, and the record's own reason is rewritten
+      // twice on the way through — the kill is when the session ended.
+      expect(byId(await harnessed.store.load(), 'id1')?.endedAt).toBe(NOW);
+    });
+  });
+
   test('starts the replacement without inheriting the dead session’s prompt', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, [hung({ id: 'id1' })]);

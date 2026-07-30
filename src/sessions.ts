@@ -517,7 +517,11 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     record: SessionRecord,
     killed: HostSession | undefined,
   ): Pick<SessionRecord, 'endedAt' | 'hostSessionId' | 'pid'> => ({
-    endedAt: now(),
+    // Stamped once. A restart rewrites this record's reason twice more before it is
+    // done — once its replacement is known — and the end time must not walk forward
+    // with those writes: retention is measured from it, and it is the only account of
+    // when the session actually stopped.
+    endedAt: record.endedAt ?? now(),
     hostSessionId: killed?.sessionId ?? record.hostSessionId,
     pid: killed?.pid ?? record.pid,
   });
