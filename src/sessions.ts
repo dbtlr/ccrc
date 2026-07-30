@@ -19,7 +19,17 @@ export type SessionListing = {
   readonly hostSessions: readonly HostSession[];
 };
 
+/**
+ * What a client is told about a registry entry. The name is all a launch needs,
+ * and the configured path stays on the host rather than being enumerable by
+ * anything that can reach the API.
+ */
+export type RepoSummary = {
+  readonly name: string;
+};
+
 export type SessionService = {
+  readonly listRepos: () => readonly RepoSummary[];
   readonly launch: (input: LaunchInput) => Promise<SessionView>;
   readonly list: () => Promise<SessionListing>;
   readonly get: (id: string) => Promise<SessionView>;
@@ -303,6 +313,8 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
   };
 
+  const listRepos = (): readonly RepoSummary[] => config.repos.map((repo) => ({ name: repo.name }));
+
   const list = (): Promise<SessionListing> => reconcile();
 
   const get = async (id: string): Promise<SessionView> => {
@@ -344,5 +356,5 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { ...stopped, activity: 'unknown' };
   };
 
-  return { get, launch, list, stop };
+  return { get, launch, list, listRepos, stop };
 };

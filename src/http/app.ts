@@ -112,6 +112,9 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
 
   app.get('/healthz', (context) => context.json({ ok: true }));
 
+  // The console cannot read the TOML, so the registry it picks from comes from here.
+  app.get('/repos', (context) => context.json({ repos: service.listRepos() }));
+
   app.post('/sessions', async (context) => {
     const input = readLaunchInput(await parseJsonBody(context.req.raw));
     const session = await service.launch(input);

@@ -87,6 +87,42 @@ describe('healthz', () => {
   });
 });
 
+describe('repo registry', () => {
+  test('lists the registry names the console can launch', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await harnessed.app.request('/repos');
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        repos: [{ name: 'example' }, { name: 'Side Project' }],
+      });
+    });
+  });
+
+  test('does not publish where the repos live on the host', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const body = await (await harnessed.app.request('/repos')).text();
+
+      expect(body).not.toContain('/repos/example');
+    });
+  });
+
+  test('an empty registry is an empty list, not an error', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, 'bind = "127.0.0.1"\n');
+
+      const response = await harnessed.app.request('/repos');
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ repos: [] });
+    });
+  });
+});
+
 describe('session lifecycle', () => {
   test('launches, lists, fetches, and stops a session', async () => {
     await withTempDir(async (dir) => {
