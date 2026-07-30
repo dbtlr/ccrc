@@ -37,6 +37,11 @@ const start = async (): Promise<void> => {
     statePath,
   });
 
+  // Whatever an interrupted creation left behind goes before the listener is up: once
+  // requests are being accepted, a live creation's staging directory would be
+  // indistinguishable from a leftover. It cannot throw.
+  await workspaces.sweepStaging();
+
   const server = Bun.serve({
     fetch: createApp(service, {
       allowedOrigins: config.allowedOrigins,
@@ -53,11 +58,6 @@ const start = async (): Promise<void> => {
   // Not awaited: the first tick talks to tmux and the claude CLI, and the API is
   // useful before that answers.
   startSupervisor({ intervalMs: config.supervision.intervalMs, logger, service });
-
-  // Whatever an interrupted creation left behind goes now, while nothing is running.
-  // Not awaited either, and it cannot throw: a stale staging directory is untidy, not
-  // a reason to hold up the daemon.
-  void workspaces.sweepStaging();
 
   const repoNames = config.repos.map((repo) => repo.name).join(', ') || 'none';
   const root = config.workspacesRoot ?? 'not configured';

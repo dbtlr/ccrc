@@ -115,8 +115,9 @@ behind it, and a creation that fails leaves nothing under the root at all. Two c
 racing for one name give one `201` and one `409` — the rename decides it. Anything git says
 goes to the log, not the response; the response names the step that failed.
 
-If the root cannot be read at all, the scan is _unknown_ rather than empty: `/repos` answers
-`502` instead of quietly listing only the configured repos, and launching an unlisted name
+If the root cannot be read at all, the scan is _unknown_ rather than empty: `/repos` still
+answers `200` with the configured repos, but flags the gap as `workspacesUnavailable: true`
+rather than passing a short list off as the whole registry, and launching an unlisted name
 answers `502` instead of "no such repo". Configured repos keep launching throughout — nothing
 about them depends on the scan.
 

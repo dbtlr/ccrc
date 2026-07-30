@@ -213,9 +213,13 @@ describe('staging hygiene', () => {
         },
       });
 
-      await adapter.discard(staging);
+      try {
+        await adapter.discard(staging);
 
-      expect(await readdir(root)).toEqual([]);
+        expect(await readdir(root)).toEqual([]);
+      } finally {
+        await chmod(root, 0o700);
+      }
     });
   });
 

@@ -104,14 +104,22 @@ export const createRepoRegistry = (options: RegistryOptions): RepoRegistry => {
    * A root that simply does not exist yet is a different answer, and an honest one:
    * there is nothing there.
    */
+  let scanFailureLogged = false;
   const scan = async (): Promise<readonly string[]> => {
     if (adapter === undefined || root === null) {
       return [];
     }
     try {
-      return await adapter.listDirectories(root);
+      const listed = await adapter.listDirectories(root);
+      scanFailureLogged = false;
+      return listed;
     } catch (cause) {
-      logger.error(`ccrcd could not scan the workspaces root: ${messageOf(cause)}`);
+      // Logged once per outage, not once per poll — the console asks every few
+      // seconds, and a dropped mount would otherwise fill the log with one line.
+      if (!scanFailureLogged) {
+        scanFailureLogged = true;
+        logger.error(`ccrcd could not scan the workspaces root: ${messageOf(cause)}`);
+      }
       throw cause;
     }
   };
@@ -235,6 +243,10 @@ export const createWorkspaceService = (options: WorkspaceServiceOptions): Worksp
 
     const staging = join(realRoot, `.${name}.creating-${crypto.randomUUID().slice(0, 8)}`);
     const created = await adapter.createDirectory(staging);
+    // Where the workspace currently sits on disk: staging until the publish rename
+    // lands, the published path after — so a failure past the rename cleans up the
+    // live directory rather than no-op'ing on the staging path that no longer exists.
+    let current = created;
     try {
       if (dirname(created) !== realRoot) {
         throw new BadRequestError(`"${name}" does not name a directory inside the workspaces root`);
@@ -246,13 +258,14 @@ export const createWorkspaceService = (options: WorkspaceServiceOptions): Worksp
         throw new ConflictError(`workspace "${name}" already exists`);
       }
       const published = await adapter.publish(created, target);
+      current = published;
       if (dirname(published) !== realRoot) {
         throw new BadRequestError(`"${name}" does not name a directory inside the workspaces root`);
       }
       logger.info(`ccrcd created workspace "${name}"`);
       return { name, path: published };
     } catch (cause) {
-      await adapter.discard(created);
+      await adapter.discard(current);
       logger.error(`ccrcd could not create workspace "${name}": ${messageOf(cause)}`);
       throw cause;
     }

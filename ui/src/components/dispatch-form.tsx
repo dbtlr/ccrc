@@ -78,6 +78,8 @@ export const DispatchForm = ({
       const message = trimmed === '' ? {} : { prompt: trimmed };
       if (naming) {
         onCreateAndLaunch({ name: name.trim(), ...message });
+        setName('');
+        setCreating(false);
       } else {
         onLaunch({ repo, ...message });
       }
