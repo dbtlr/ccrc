@@ -366,28 +366,44 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       });
       const hostSessions = await adapter.listHostSessions();
       const { record, records } = await settle((current) => {
+        // Built onto the record as it stands, never onto the pre-launch snapshot: a
+        // `DELETE` that landed while this launch was settling has already written to
+        // it, and spreading the snapshot would revert that stop — leaving a record
+        // that claims to be running with no tmux session behind it.
+        const stored = current.find((entry) => entry.id === pending.id) ?? pending;
         const matched = correlate(pending, hostSessions, current);
-        return {
-          ...pending,
+        const learned = {
           attachUrl,
           // Both identifiers are kept: they are how this record claims its host
           // entry against every other record's correlation.
           hostSessionId: matched?.sessionId ?? null,
           pid: matched?.pid ?? null,
-          status: 'running',
         };
+        // A record that went terminal mid-launch stays terminal. Its tmux session is
+        // already dead — or reconciliation will find it so — and nothing may promote
+        // it back to running.
+        return TERMINAL_STATUSES.has(stored.status)
+          ? { ...stored, ...learned }
+          : { ...stored, ...learned, status: 'running' };
       });
       return { hostSessions, record, records };
     } catch (cause) {
       await tearDown(pending.tmuxName);
-      await settle((current) => ({
-        ...(current.find((entry) => entry.id === pending.id) ?? pending),
-        endedAt: now(),
-        status: 'failed',
-        // Only a deliberate failure describes itself: anything else may carry a
-        // command line or a host path, and the reason is served to clients.
-        stopReason: cause instanceof CcrcError ? cause.message : 'the launch failed',
-      }));
+      await settle((current) => {
+        const stored = current.find((entry) => entry.id === pending.id) ?? pending;
+        // An operator's stop that got there first is the truthful account of how this
+        // record ended; a failed launch must not overwrite it.
+        return TERMINAL_STATUSES.has(stored.status)
+          ? stored
+          : {
+              ...stored,
+              endedAt: now(),
+              status: 'failed',
+              // Only a deliberate failure describes itself: anything else may carry a
+              // command line or a host path, and the reason is served to clients.
+              stopReason: cause instanceof CcrcError ? cause.message : 'the launch failed',
+            };
+      });
       throw cause;
     }
   };

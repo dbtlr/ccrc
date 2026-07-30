@@ -532,6 +532,56 @@ describe('concurrency', () => {
     });
   });
 
+  test('a stop that completes before a launch settles is never undone by it', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.hostSessions = [
+        hostSession({ cwd: '/repos/example', pid: 4242, startedAt: 1_764_000_000_000 }),
+      ];
+
+      // Hold the launch just before it settles.
+      const settling = Promise.withResolvers<void>();
+      harnessed.adapter.listDelay = () => settling.promise;
+      const launch = postSession(harnessed, { repo: 'example' });
+      await Bun.sleep(1);
+      harnessed.adapter.listDelay = () => Promise.resolve();
+
+      // The stop runs to completion first: tmux is killed and the record is stopped.
+      expect((await harnessed.app.request('/sessions/id1', { method: 'DELETE' })).status).toBe(200);
+      settling.resolve();
+      await launch;
+
+      // The settle may not resurrect the record: the tmux session is already dead,
+      // so a `running` record here is a phantom nothing can stop.
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ endedAt: 1_764_000_000_000, status: 'stopped' });
+      const listed = (await (await harnessed.app.request('/sessions/id1')).json()) as Record<
+        string,
+        unknown
+      >;
+      expect(listed.status).toBe('stopped');
+    });
+  });
+
+  test('a launch that fails after a stop leaves the stop standing', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.attachUrl = new LaunchError('no attach URL appeared');
+
+      const settling = Promise.withResolvers<void>();
+      harnessed.adapter.stopDelay = () => settling.promise;
+      const launch = postSession(harnessed, { repo: 'example' });
+      await Bun.sleep(1);
+      const deleted = harnessed.app.request('/sessions/id1', { method: 'DELETE' });
+      await Bun.sleep(1);
+      settling.resolve();
+      await Promise.all([launch, deleted]);
+
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ endedAt: 1_764_000_000_000, status: 'stopped' });
+    });
+  });
+
   test('concurrent launches each get their own tmux name and record', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
