@@ -34,6 +34,11 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <!-- A daemon that cannot start at all — config deleted, bun moved — would otherwise
+       be restarted every 10s forever, filling the error log with the same line. This
+       spaces those attempts out; the log still needs an eye on it. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>StandardOutPath</key>
   <string>__LOG_DIR__/ccrcd.out.log</string>
   <key>StandardErrorPath</key>

@@ -21,6 +21,16 @@ if [ -z "${bun}" ]; then
   exit 1
 fi
 
+# The agent runs with the PATH captured here and inherits nothing else, so the tools
+# ccrcd shells out to have to be findable in it. Otherwise the daemon comes up, reports
+# itself unwell, and fails every launch.
+for tool in tmux claude; do
+  if ! command -v "${tool}" >/dev/null 2>&1; then
+    echo "${tool} is not on PATH; ccrcd runs every session through it" >&2
+    exit 1
+  fi
+done
+
 # A missing config is a fatal startup error, and KeepAlive would turn that into a
 # restart loop. Refuse the install instead.
 if [ ! -f "${config}" ]; then
@@ -30,15 +40,27 @@ fi
 
 mkdir -p "${agents_dir}" "${log_dir}"
 
-sed \
-  -e "s|__LABEL__|${label}|g" \
-  -e "s|__BUN__|${bun}|g" \
-  -e "s|__REPO_DIR__|${repo_dir}|g" \
-  -e "s|__HOME__|${HOME}|g" \
-  -e "s|__PATH__|${PATH}|g" \
-  -e "s|__CONFIG__|${config}|g" \
-  -e "s|__LOG_DIR__|${log_dir}|g" \
-  "${template}" >"${plist}"
+# Staged first: writing straight to the plist would truncate a working agent's
+# definition before knowing whether this render even succeeds.
+staged="$(mktemp "${TMPDIR:-/tmp}/ccrcd-plist.XXXXXX")"
+trap 'rm -f "${staged}"' EXIT
+
+CCRC_TEMPLATE="${template}" \
+  CCRC_LABEL="${label}" \
+  CCRC_BUN="${bun}" \
+  CCRC_REPO_DIR="${repo_dir}" \
+  CCRC_HOME_DIR="${HOME}" \
+  CCRC_AGENT_PATH="${PATH}" \
+  CCRC_CONFIG_PATH="${config}" \
+  CCRC_LOG_DIR="${log_dir}" \
+  bash "${here}/render-plist.sh" >"${staged}"
+
+if command -v plutil >/dev/null 2>&1; then
+  plutil -lint "${staged}" >/dev/null
+fi
+
+mv "${staged}" "${plist}"
+trap - EXIT
 
 domain="gui/$(id -u)"
 launchctl bootout "${domain}/${label}" 2>/dev/null || true

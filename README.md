@@ -78,8 +78,16 @@ restart_cap_window_minutes = 60
 stopped_retention_days = 7        # how long stopped/failed records are kept
 ```
 
-Durations must be positive numbers and `restart_cap` a whole number of 0 or more; anything
-else is a fatal startup error rather than a setting that silently misbehaves.
+Every duration is a whole number of its own unit inside a range that keeps the loop sane,
+and `restart_cap` is a whole number of 0 or more; anything else is a fatal startup error
+rather than a setting that silently misbehaves.
+
+| Key                          | Range                                            | Why the ends matter                                                                                                        |
+| ---------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `reconcile_interval_seconds` | 5–3600                                           | Under a few seconds ticks pile onto each other; past 2^31-1 ms a timer wraps and fires continuously.                       |
+| `hang_threshold_minutes`     | 1–1440                                           | A fraction of a minute would call every busy session hung on the next tick.                                                |
+| `restart_cap_window_minutes` | 1–10080, and at least `hang_threshold_minutes`   | A window shorter than the threshold could never hold two restarts of one session.                                          |
+| `stopped_retention_days`     | 1–365, and at least `restart_cap_window_minutes` | Restart history lives on records; retention that expires inside the window would drop the history the cap is counted from. |
 
 ### Behind a reverse proxy
 
@@ -136,11 +144,18 @@ packaging/launchd/install.sh     # writes ~/Library/LaunchAgents/dev.ccrc.ccrcd.
 packaging/launchd/uninstall.sh   # unloads it and removes the plist
 ```
 
-Logs land in `~/Library/Logs/ccrc/ccrcd.out.log` and `ccrcd.err.log`. The config has to
-exist first — a missing one is a fatal startup error, and `KeepAlive` would otherwise turn
-that into a restart loop — so the installer refuses to run without it. Set `CCRC_CONFIG`
-when installing to point the agent at a config elsewhere. It is a user agent, not a system
-daemon: sessions run as the operator, and nothing starts before login.
+Logs land in `~/Library/Logs/ccrc/ccrcd.out.log` and `ccrcd.err.log`. **Nothing rotates
+them** — launchd appends until something else truncates them, so they belong in whatever
+log rotation the host already runs.
+
+The installer refuses to run unless `bun`, `tmux`, and the `claude` CLI are all on the
+`PATH` it captures (the agent inherits that `PATH` and nothing else, so a tool missing from
+it fails every launch) and the config already exists — a missing config is a fatal startup
+error, and `KeepAlive` would turn that into a restart loop. `ThrottleInterval` spaces failed
+starts 30 seconds apart so a daemon that cannot start at all cannot spin; the error log is
+still where you find out. Set `CCRC_CONFIG` when installing to point the agent at a config
+elsewhere. It is a user agent, not a system daemon: sessions run as the operator, and
+nothing starts before login.
 
 Uninstalling only removes the agent. Sessions already running under tmux stay up; stop them
 through the API.
