@@ -470,14 +470,18 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     if (session.status !== 'busy' || session.sessionId === null) {
       return null;
     }
-    const mtime = await adapter
-      .transcriptMtime({ cwd: session.cwd ?? record.repoPath, sessionId: session.sessionId })
-      .catch((cause: unknown) => {
-        logger.error(
-          `ccrcd could not read the transcript of session ${record.id}, so it was left running: ${messageOf(cause)}`,
-        );
-        return null;
+    let mtime: number | null;
+    try {
+      mtime = await adapter.transcriptMtime({
+        cwd: session.cwd ?? record.repoPath,
+        sessionId: session.sessionId,
       });
+    } catch (cause) {
+      logger.error(
+        `ccrcd could not read the transcript of session ${record.id}, so it was left running: ${messageOf(cause)}`,
+      );
+      return null;
+    }
     if (mtime === null) {
       return null;
     }
@@ -546,15 +550,14 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       logger.error(`ccrcd stopped session ${record.id}: ${reason}`);
       return { id: record.id, reason, restartedAs: null };
     }
-    const replacement = await startSession({ repo, restartedFrom: record.id }).then(
-      (started) => started.record.id,
-      (cause: unknown) => {
-        logger.error(
-          `ccrcd stopped hung session ${record.id} but could not start its replacement: ${messageOf(cause)}`,
-        );
-        return null;
-      },
-    );
+    let replacement: string | null = null;
+    try {
+      replacement = (await startSession({ repo, restartedFrom: record.id })).record.id;
+    } catch (cause) {
+      logger.error(
+        `ccrcd stopped hung session ${record.id} but could not start its replacement: ${messageOf(cause)}`,
+      );
+    }
     if (replacement === null) {
       const reason = `${symptom}; the replacement session could not be started`;
       await retire(record.id, reason, null);

@@ -80,9 +80,22 @@ export const startSupervisor = (options: SuperviseOptions): Supervisor => {
     }
   };
 
-  const cancel = ticker(intervalMs, () => void tick());
+  /**
+   * A tick already catches every phase, so this only covers the last way one could
+   * reject — a broken log sink — and an unhandled rejection is not how this loop
+   * ends. Nobody is waiting on the timer's ticks to find out either way.
+   */
+  const detached = async (): Promise<void> => {
+    try {
+      await tick();
+    } catch {
+      // Nothing left to report it with.
+    }
+  };
+
+  const cancel = ticker(intervalMs, () => void detached());
   // One tick immediately: after a host reboot the records left in the state file
   // all claim to be running, and nothing should have to call the API to find out
   // otherwise. Reconciliation only ever retires them — it never relaunches.
-  return { started: tick(), stop: cancel, tick };
+  return { started: detached(), stop: cancel, tick };
 };
