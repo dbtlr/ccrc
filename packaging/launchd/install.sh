@@ -101,8 +101,12 @@ launchctl bootout "${domain}/${label}" 2>/dev/null || true
 if ! launchctl bootstrap "${domain}" "${plist}"; then
   if [ -n "${previous}" ]; then
     mv "${previous}" "${plist}"
-    launchctl bootstrap "${domain}" "${plist}" || true
-    echo "bootstrap of the new agent failed; restored the previous plist and agent" >&2
+    if launchctl bootstrap "${domain}" "${plist}" 2>/dev/null; then
+      echo "bootstrap of the new agent failed; restored the previous plist and agent" >&2
+    else
+      echo "bootstrap of the new agent failed, and so did re-bootstrapping the previous one;" >&2
+      echo "its plist is restored at ${plist} — run: launchctl bootstrap ${domain} ${plist}" >&2
+    fi
   else
     rm -f "${plist}"
     echo "bootstrap of the new agent failed; removed its plist" >&2
