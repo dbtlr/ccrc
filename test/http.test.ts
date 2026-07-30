@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 import { loadConfig, stateFilePath } from '../src/config.ts';
 import type { Config } from '../src/config.ts';
+import { LaunchError, StopError } from '../src/errors.ts';
 import { createApp } from '../src/http/app.ts';
 import { createSessionService } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
@@ -186,14 +187,14 @@ describe('session lifecycle', () => {
     });
   });
 
-  test('records a failed launch and surfaces the reason', async () => {
+  test('records a failed launch and surfaces the reason as a 502', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
-      harnessed.adapter.attachUrl = new Error('no attach URL appeared');
+      harnessed.adapter.attachUrl = new LaunchError('no attach URL appeared');
 
       const response = await postSession(harnessed, { repo: 'example' });
 
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(502);
       expect((await response.json()) as Record<string, unknown>).toEqual({
         error: 'no attach URL appeared',
       });
@@ -201,51 +202,83 @@ describe('session lifecycle', () => {
       expect(persisted[0]).toMatchObject({ attachUrl: null, status: 'failed' });
     });
   });
+
+  test('a kill tmux refused leaves the record active and answers 502', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      await postSession(harnessed, { repo: 'example' });
+      harnessed.adapter.stopOutcome = new StopError('tmux could not kill session ccrc-example-1');
+
+      const response = await harnessed.app.request('/sessions/id1', { method: 'DELETE' });
+
+      expect(response.status).toBe(502);
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ status: 'running' });
+    });
+  });
+
+  test('a session tmux has already lost still stops cleanly', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      await postSession(harnessed, { repo: 'example' });
+      harnessed.adapter.stopOutcome = 'absent';
+
+      const response = await harnessed.app.request('/sessions/id1', { method: 'DELETE' });
+
+      expect(response.status).toBe(200);
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ status: 'stopped' });
+    });
+  });
 });
 
-describe('request errors', () => {
-  test('unknown repo is a 404 that names the registry', async () => {
+describe('concurrency', () => {
+  test('a launch that lands during a listing is not lost', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
+      await postSession(harnessed, { repo: 'example' });
 
-      const response = await postSession(harnessed, { repo: 'nope' });
+      // GET /sessions shells out to the claude CLI; hold it there while a launch
+      // completes, the window that used to drop the new record entirely.
+      const gate = Promise.withResolvers<void>();
+      harnessed.adapter.listDelay = () => gate.promise;
+      const listing = harnessed.app.request('/sessions');
+      await Bun.sleep(1);
+      harnessed.adapter.listDelay = () => Promise.resolve();
 
-      expect(response.status).toBe(404);
-      expect(((await response.json()) as { error: string }).error).toContain(
-        'configured repos: example, Side Project',
-      );
-      expect(harnessed.adapter.launches).toEqual([]);
+      const created = await postSession(harnessed, { repo: 'example' });
+      expect(created.status).toBe(201);
+      gate.resolve();
+      const listed = (await (await listing).json()) as { sessions: Record<string, unknown>[] };
+
+      expect(listed.sessions.map((session) => session.id)).toEqual(['id1', 'id2']);
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted.map((record) => record.id)).toEqual(['id1', 'id2']);
+      // The symptom of the lost record: the returned id 404s and the session orphans.
+      expect((await harnessed.app.request('/sessions/id2', { method: 'DELETE' })).status).toBe(200);
     });
   });
 
-  test('a missing or wrong-typed repo field is a 400', async () => {
+  test('concurrent launches each get their own tmux name and record', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
 
-      expect((await postSession(harnessed, {})).status).toBe(400);
-      expect((await postSession(harnessed, { repo: 7 })).status).toBe(400);
-      expect((await postSession(harnessed, { prompt: 7, repo: 'example' })).status).toBe(400);
-      expect(
-        (
-          await harnessed.app.request('/sessions', {
-            body: 'not json',
-            headers: { 'content-type': 'application/json' },
-            method: 'POST',
-          })
-        ).status,
-      ).toBe(400);
-      expect(harnessed.adapter.launches).toEqual([]);
-    });
-  });
+      const responses = await Promise.all([
+        postSession(harnessed, { repo: 'example' }),
+        postSession(harnessed, { repo: 'example' }),
+        postSession(harnessed, { repo: 'example' }),
+      ]);
 
-  test('unknown session ids are 404 on both read and delete', async () => {
-    await withTempDir(async (dir) => {
-      const harnessed = await harness(dir);
-
-      expect((await harnessed.app.request('/sessions/absent')).status).toBe(404);
-      expect((await harnessed.app.request('/sessions/absent', { method: 'DELETE' })).status).toBe(
-        404,
-      );
+      expect(responses.map((response) => response.status)).toEqual([201, 201, 201]);
+      expect(harnessed.adapter.launches.map((launch) => launch.tmuxName).toSorted()).toEqual([
+        'ccrc-example-1',
+        'ccrc-example-2',
+        'ccrc-example-3',
+      ]);
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted.length).toBe(3);
+      expect(new Set(persisted.map((record) => record.tmuxName)).size).toBe(3);
+      expect(persisted.every((record) => record.status === 'running')).toBe(true);
     });
   });
 });

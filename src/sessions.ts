@@ -2,8 +2,8 @@ import { hostname } from 'node:os';
 
 import type { ClaudeAdapter, HostSession, SessionActivity } from './adapter/claude.ts';
 import { findRepo } from './config.ts';
-import type { Config } from './config.ts';
-import { BadRequestError, NotFoundError } from './errors.ts';
+import type { Config, RepoEntry } from './config.ts';
+import { BadRequestError, CcrcError, NotFoundError } from './errors.ts';
 import type { SessionRecord, StateStore } from './state.ts';
 
 /** A stored record plus the live detail reconciliation adds on read. */
@@ -49,6 +49,27 @@ export const slugify = (value: string): string =>
     .replaceAll(/^-+|-+$/g, '') || 'repo';
 
 const ACTIVE_STATUSES = new Set(['starting', 'running']);
+
+/** Big enough for a pasted brief, small enough to stay well inside argv limits. */
+const MAX_PROMPT_LENGTH = 32_768;
+
+/**
+ * A prompt reaches an exec argv, where a NUL byte is a hard error and an
+ * oversized string is E2BIG. Both are rejected here so neither surfaces as an
+ * internal failure carrying the command line.
+ */
+const checkPrompt = (prompt: string | undefined): string | undefined => {
+  if (prompt === undefined) {
+    return undefined;
+  }
+  if (prompt.includes('\0')) {
+    throw new BadRequestError('"prompt" must not contain NUL bytes');
+  }
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    throw new BadRequestError(`"prompt" must be at most ${MAX_PROMPT_LENGTH} characters`);
+  }
+  return prompt;
+};
 
 /**
  * Names are never reused, including by stopped records: a recycled tmux name
@@ -114,21 +135,40 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   const now = options.now ?? Date.now;
   const generateId = options.generateId ?? randomId;
 
-  const reconcile = async (records: readonly SessionRecord[]): Promise<SessionListing> => {
+  /**
+   * The slow adapter reads happen before the store is touched, so reconciliation
+   * holds the state mutex only for the read-mutate-write itself and a launch
+   * completing alongside a listing cannot be dropped.
+   */
+  const reconcile = async (): Promise<SessionListing> => {
     const [liveNames, hostSessions] = await Promise.all([
       adapter.liveSessionNames(),
       adapter.listHostSessions(),
     ]);
     const live = new Set(liveNames);
-    const reconciled = records.map((record) => stopIfGone(record, live));
-    const changed = reconciled.some((record, index) => record.status !== records[index]?.status);
-    if (changed) {
-      await store.save(reconciled);
-    }
+    const sessions = await store.update((records) => {
+      const reconciled = records.map((record) => stopIfGone(record, live));
+      const changed = reconciled.some((record, index) => record.status !== records[index]?.status);
+      return { records: changed ? reconciled : records, result: changed ? reconciled : records };
+    });
     return {
       hostSessions,
-      sessions: reconciled.map((record) => toView(record, hostSessions)),
+      sessions: sessions.map((record) => toView(record, hostSessions)),
     };
+  };
+
+  /** A configured path that cannot be resolved is a registry problem, not a crash. */
+  const trustedPath = async (repo: RepoEntry): Promise<string> => {
+    try {
+      return await adapter.trustRepo(repo.path);
+    } catch (cause) {
+      if (cause instanceof CcrcError) {
+        throw cause;
+      }
+      throw new BadRequestError(
+        `repo "${repo.name}" cannot be launched: its configured path could not be resolved on this host`,
+      );
+    }
   };
 
   const launch = async (input: LaunchInput): Promise<SessionView> => {
@@ -137,44 +177,45 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
     const repo = findRepo(config, input.repo);
     if (repo === undefined) {
-      const known = config.repos.map((entry) => entry.name).join(', ') || 'none configured';
-      throw new NotFoundError(`unknown repo "${input.repo}" — configured repos: ${known}`);
+      throw new NotFoundError(`unknown repo "${input.repo}"`);
     }
+    const prompt = checkPrompt(input.prompt);
 
-    const repoPath = await adapter.trustRepo(repo.path);
-    const stored = await store.load();
-    const { index, tmuxName } = allocateNames(
-      slugify(repo.name),
-      stored,
-      await adapter.liveSessionNames(),
-    );
-    const id = generateId();
-    const pending: SessionRecord = {
-      attachUrl: null,
-      host,
-      id,
-      name: `${repo.name}-${index}`,
-      pid: null,
-      rcName: `ccrc-${id}`,
-      repoName: repo.name,
-      repoPath,
-      startedAt: now(),
-      status: 'starting',
-      tmuxName,
-    };
-    await store.save([...stored, pending]);
+    const repoPath = await trustedPath(repo);
+    const liveNames = await adapter.liveSessionNames();
+    // Allocating the name and recording it are one serialized step: concurrent
+    // launches would otherwise all pick the same tmux name.
+    const pending = await store.update((records) => {
+      const { index, tmuxName } = allocateNames(slugify(repo.name), records, liveNames);
+      const id = generateId();
+      const record: SessionRecord = {
+        attachUrl: null,
+        host,
+        id,
+        name: `${repo.name}-${index}`,
+        pid: null,
+        rcName: `ccrc-${id}`,
+        repoName: repo.name,
+        repoPath,
+        startedAt: now(),
+        status: 'starting',
+        tmuxName,
+      };
+      return { records: [...records, record], result: record };
+    });
 
-    const settle = async (record: SessionRecord): Promise<void> => {
-      const current = await store.load();
-      await store.save(current.map((entry) => (entry.id === record.id ? record : entry)));
-    };
+    const settle = (record: SessionRecord): Promise<void> =>
+      store.update((records) => ({
+        records: records.map((entry) => (entry.id === record.id ? record : entry)),
+        result: undefined,
+      }));
 
     try {
       const attachUrl = await adapter.launchSession({
-        prompt: input.prompt,
+        prompt,
         rcName: pending.rcName,
         repoPath,
-        tmuxName,
+        tmuxName: pending.tmuxName,
       });
       const hostSessions = await adapter.listHostSessions();
       const launched: SessionRecord = {
@@ -191,10 +232,10 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
   };
 
-  const list = async (): Promise<SessionListing> => reconcile(await store.load());
+  const list = (): Promise<SessionListing> => reconcile();
 
   const get = async (id: string): Promise<SessionView> => {
-    const listing = await reconcile(await store.load());
+    const listing = await reconcile();
     const found = listing.sessions.find((session) => session.id === id);
     if (found === undefined) {
       throw new NotFoundError(`unknown session "${id}"`);
@@ -202,6 +243,10 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return found;
   };
 
+  /**
+   * The record is only marked stopped once tmux confirms the session is gone; a
+   * refused kill propagates so the record stays active and reconcilable.
+   */
   const stop = async (id: string): Promise<SessionView> => {
     const stored = await store.load();
     const target = stored.find((record) => record.id === id);
@@ -210,7 +255,10 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
     await adapter.stopSession(target.tmuxName);
     const stopped: SessionRecord = { ...target, status: 'stopped' };
-    await store.save(stored.map((record) => (record.id === id ? stopped : record)));
+    await store.update((records) => ({
+      records: records.map((record) => (record.id === id ? stopped : record)),
+      result: undefined,
+    }));
     return { ...stopped, activity: 'unknown' };
   };
 
