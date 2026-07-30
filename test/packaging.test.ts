@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { withTempDir } from './support.ts';
+
 /**
  * The LaunchAgent is a template plus an installer, and the whole point of that
  * split is that no committed file names a host. These tests hold that line: they
@@ -72,6 +74,36 @@ describe('plist rendering', () => {
 
     expect(linted.stdout.toString().trim()).toMatch(/OK$/);
     expect(linted.exitCode).toBe(0);
+  });
+
+  test('accepts a value that happens to look like a marker', async () => {
+    // `__BUILD__` is a legal directory name and none of the daemon's business.
+    const rendered = await render({ CCRC_REPO_DIR: '/home/tester/__BUILD__/ccrc' });
+
+    expect(rendered).toContain('<string>/home/tester/__BUILD__/ccrc</string>');
+  });
+
+  test('refuses a template placeholder the renderer does not know about', async () => {
+    await withTempDir(async (dir) => {
+      const template = join(dir, 'template.plist');
+      await Bun.write(template, '<plist><string>__SOMETHING_NEW__</string></plist>\n');
+
+      const result = Bun.spawnSync(['bash', RENDER], {
+        env: {
+          CCRC_AGENT_PATH: '/usr/bin',
+          CCRC_BUN: '/usr/local/bin/bun',
+          CCRC_CONFIG_PATH: '/home/tester/config.toml',
+          CCRC_HOME_DIR: '/home/tester',
+          CCRC_LABEL: 'dev.ccrc.ccrcd',
+          CCRC_LOG_DIR: '/home/tester/logs',
+          CCRC_REPO_DIR: '/home/tester/code/ccrc',
+          CCRC_TEMPLATE: template,
+        },
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.toString()).toMatch(/__SOMETHING_NEW__/);
+    });
   });
 
   test('leaves no marker unsubstituted for ordinary paths', async () => {
