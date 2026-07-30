@@ -162,6 +162,44 @@ describe('reboot reconciliation', () => {
     });
   });
 
+  test('promotes a starting record whose tmux session outlived the launch', async () => {
+    await withTempDir(async (dir) => {
+      // What a daemon killed mid-launch leaves behind: no attach URL was ever
+      // scraped, but the session it started is alive and running with bypassPermissions.
+      const harnessed = await harness(dir, [
+        sessionRecord({
+          attachUrl: null,
+          id: 'id1',
+          startedAt: NOW - 5 * MINUTE,
+          status: 'starting',
+        }),
+      ]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+
+      const listing = await harnessed.service.reconcile();
+
+      expect(listing.sessions[0]?.status).toBe('running');
+      const stored = await harnessed.store.load();
+      expect(stored[0]?.status).toBe('running');
+      // Truthful about what is known: the URL was never captured and is not invented.
+      expect(stored[0]?.attachUrl).toBeNull();
+      expect(stored[0]?.endedAt).toBeNull();
+    });
+  });
+
+  test('leaves a starting record alone while its launch could still be running', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [
+        sessionRecord({ attachUrl: null, id: 'id1', startedAt: NOW - 5_000, status: 'starting' }),
+      ]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+
+      await harnessed.service.reconcile();
+
+      expect((await harnessed.store.load())[0]?.status).toBe('starting');
+    });
+  });
+
   test('leaves records alone when tmux cannot say what is live', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, [sessionRecord({ id: 'id1', status: 'running' })]);

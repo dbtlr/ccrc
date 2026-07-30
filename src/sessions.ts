@@ -227,6 +227,24 @@ const stopIfGone = (record: SessionRecord, live: LivenessSnapshot, at: number): 
       }
     : record;
 
+/**
+ * A `starting` record with a live tmux session, long past any launch that could
+ * still be in progress → running.
+ *
+ * A daemon killed mid-launch leaves exactly that: the launch that would have settled
+ * the record is gone, so nothing will ever move it off `starting` — while the session
+ * it started keeps running with `bypassPermissions`. The record is corrected to what
+ * tmux says rather than left immortal. The attach URL stays null: it is printed once
+ * into the pane and was never captured, and a record saying "running, URL unknown" is
+ * the truth. (A record whose tmux session is gone is retired by `stopIfGone` first.)
+ */
+const promoteIfStranded = (record: SessionRecord, live: LivenessSnapshot): SessionRecord =>
+  record.status === 'starting' &&
+  live.names.has(record.tmuxName) &&
+  record.startedAt + LAUNCH_GRACE_MS <= live.takenAt
+    ? { ...record, status: 'running' }
+    : record;
+
 const withoutRepoPath = (record: SessionRecord): Omit<SessionRecord, 'repoPath'> => {
   const { repoPath: _repoPath, ...view } = record;
   return view;
@@ -284,7 +302,9 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     const at = now();
     const sessions = await store.update((records) => {
       const reconciled =
-        live === undefined ? records : records.map((record) => stopIfGone(record, live, at));
+        live === undefined
+          ? records
+          : records.map((record) => promoteIfStranded(stopIfGone(record, live, at), live));
       const changed = reconciled.some((record, index) => record.status !== records[index]?.status);
       return { records: changed ? reconciled : records, result: changed ? reconciled : records };
     });
