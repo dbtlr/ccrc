@@ -171,7 +171,10 @@ runs every `reconcile_interval_seconds`, plus once at startup, and does three th
    must not start `bypassPermissions` sessions on its own. Two things keep this honest: a
    record is exempt from retirement for as long as a launch could still be running (the
    launch timeouts plus a margin), because a liveness snapshot taken during a launch
-   legitimately does not list the session yet; and a `starting` record past that window
+   legitimately does not list the session yet — including a snapshot taken _before_ the
+   record existed, which a slow fleet listing makes ordinary. Only a record stamped
+   further ahead than a whole launch window forfeits that, since a clock corrected
+   backwards would otherwise make it immortal. And a `starting` record past the window
    whose tmux session _is_ live is promoted to `running`,
    which is what a daemon killed mid-launch leaves behind (its `attachUrl` stays `null` —
    the URL is printed once into the pane and was never captured).
@@ -312,7 +315,9 @@ launch failed. `pid` and `hostSessionId` are how a record claims its entry in th
 fleet, which is what stops the next session in a repo from adopting a killed session's
 entry — the CLI lists a killed session for a while, and an adopted entry would hand a
 healthy session a stranger's activity and a stranger's stale transcript. Every kill claims
-it, an operator's `DELETE` included. The claim expires with the session: a record that has
+it — an operator's `DELETE`, the watchdog's restart, and a session that died on its own
+and is found by reconciliation. A `DELETE` still kills the tmux session and retires the
+record when the `claude` CLI cannot be reached at all; it just has no claim to record. The claim expires with the session: a record that has
 ended only claims entries that started before it did, so a pid the OS later reuses is free.
 `restarts` is the automatic-restart history the cap is counted from.
 
