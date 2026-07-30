@@ -1,9 +1,14 @@
 import { toolingConfig } from '@dbtlr/tooling';
 
 /**
- * Single-package lint/format/type config (@dbtlr/tooling). The daemon targets
- * Bun, so `node` is the closest shipped lint target — it permits `node:`
- * builtins. Tests run under `bun test`, not vitest, so the vitest target is off.
+ * Lint/format/type config for both halves of the repo (@dbtlr/tooling). The daemon
+ * targets Bun, so `node` is the closest shipped lint target — it permits `node:`
+ * builtins; the console under `ui/` is a browser React app and gets the `react`
+ * target, with its own tsconfig driving the type check. Tests run under `bun test`,
+ * not vitest, so the vitest target is off.
+ *
+ * Both targets are glob-scoped rather than whole-project, which is what keeps a
+ * `node:` import an error inside `ui/` and React lint rules out of the daemon.
  *
  * The adapter boundary is structural: only `src/adapter/**` may shell out to
  * `claude`/`tmux` or touch `~/.claude.json`, so everything outside it is barred
@@ -14,7 +19,7 @@ import { toolingConfig } from '@dbtlr/tooling';
  */
 export default toolingConfig({
   lint: {
-    ignores: ['dist/**'],
+    ignores: ['dist/**', 'ui/dist/**'],
     overrides: [
       {
         // Tests assert over untyped HTTP JSON and persisted state; they own both
@@ -65,6 +70,12 @@ export default toolingConfig({
       },
     ],
   },
-  node: true,
+  node: ['src/**', 'test/**', 'vite.config.ts'],
+  react: {
+    files: ['ui/**'],
+    // The vitest plugin reads the console's mount call as unguarded test setup.
+    // Nothing under `ui/` is a test, so the rule has nothing true to say here.
+    rules: { 'vitest/require-hook': 'off' },
+  },
   test: false,
 });

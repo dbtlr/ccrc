@@ -12,6 +12,7 @@ import type { FakeAdapter } from './support.ts';
 
 const CONFIG_TOML = `bind = "127.0.0.1"
 port = 7433
+allowed_origins = ["https://ccrc.example", "http://ccrc.example:8443"]
 
 [[repos]]
 name = "example"
@@ -31,9 +32,9 @@ type Harness = {
 
 let sequence = 0;
 
-const harness = async (dir: string): Promise<Harness> => {
+const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<Harness> => {
   const configPath = join(dir, 'config.toml');
-  await Bun.write(configPath, CONFIG_TOML);
+  await Bun.write(configPath, configToml);
   const config = await loadConfig({ CCRC_CONFIG: configPath }, join(dir, 'home'));
   const adapter = fakeAdapter();
   const statePath = stateFilePath(config);
@@ -48,7 +49,12 @@ const harness = async (dir: string): Promise<Harness> => {
     now: () => 1_764_000_000_000,
     store: createStateStore(statePath),
   });
-  return { adapter, app: createApp(service), config, statePath };
+  return {
+    adapter,
+    app: createApp(service, { allowedOrigins: config.allowedOrigins, port: config.port }),
+    config,
+    statePath,
+  };
 };
 
 const postSession = async (harnessed: Harness, body: unknown): Promise<Response> =>
@@ -81,6 +87,42 @@ describe('healthz', () => {
   });
 });
 
+describe('repo registry', () => {
+  test('lists the registry names the console can launch', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await harnessed.app.request('/repos');
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        repos: [{ name: 'example' }, { name: 'Side Project' }],
+      });
+    });
+  });
+
+  test('does not publish where the repos live on the host', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const body = await (await harnessed.app.request('/repos')).text();
+
+      expect(body).not.toContain('/repos/example');
+    });
+  });
+
+  test('an empty registry is an empty list, not an error', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, 'bind = "127.0.0.1"\n');
+
+      const response = await harnessed.app.request('/repos');
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ repos: [] });
+    });
+  });
+});
+
 describe('session lifecycle', () => {
   test('launches, lists, fetches, and stops a session', async () => {
     await withTempDir(async (dir) => {
@@ -107,10 +149,11 @@ describe('session lifecycle', () => {
         pid: 4242,
         rcName: 'ccrc-id1',
         repoName: 'example',
-        repoPath: '/repos/example',
         status: 'running',
         tmuxName: 'ccrc-example-1',
       });
+      // The configured path stays on the host, same as the registry it came from.
+      expect(session.repoPath).toBeUndefined();
       expect(harnessed.adapter.launches[0]).toEqual({
         prompt: '/plan',
         rcName: 'ccrc-id1',
@@ -125,6 +168,7 @@ describe('session lifecycle', () => {
       };
       expect(listing.sessions.length).toBe(1);
       expect(listing.sessions[0]).toMatchObject({ id: 'id1', status: 'running' });
+      expect(listing.sessions[0]?.repoPath).toBeUndefined();
       // The whole host fleet rides along, ccrcd-launched or not.
       expect(listing.hostSessions.length).toBe(2);
 
@@ -134,9 +178,9 @@ describe('session lifecycle', () => {
 
       const deleted = await harnessed.app.request('/sessions/id1', { method: 'DELETE' });
       expect(deleted.status).toBe(200);
-      expect((await deleted.json()) as Record<string, unknown>).toMatchObject({
-        status: 'stopped',
-      });
+      const stoppedBody = (await deleted.json()) as Record<string, unknown>;
+      expect(stoppedBody).toMatchObject({ status: 'stopped' });
+      expect(stoppedBody.repoPath).toBeUndefined();
       expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
 
       const afterStop = await harnessed.app.request('/sessions/id1');
@@ -510,19 +554,188 @@ describe('cross-origin defence', () => {
     });
   });
 
+  test('a configured origin may drive a mutation', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const launched = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin: 'https://ccrc.example',
+        'sec-fetch-site': 'same-origin',
+      });
+      expect(launched.status).toBe(201);
+
+      const deleted = await harnessed.app.request('/sessions/id1', {
+        headers: { origin: 'http://ccrc.example:8443' },
+        method: 'DELETE',
+      });
+      expect(deleted.status).toBe(200);
+    });
+  });
+
+  // The allow-list is exact strings, so every way of nearly being one is a stranger.
+  test.each([
+    'http://ccrc.example',
+    'https://ccrc.example:8443',
+    'https://ccrc.example.evil',
+    'https://evil.ccrc.example',
+    'https://ccrc.exampl',
+    'https://ccrc.example/',
+    'https://ccrc.example/sessions',
+    'HTTPS://CCRC.EXAMPLE',
+    'null',
+  ])('the near-miss origin %s is still a 403', async (origin) => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin,
+      });
+
+      expect(response.status).toBe(403);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('an empty allow-list refuses a foreign origin outright', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(
+        dir,
+        'bind = "127.0.0.1"\n\n[[repos]]\nname = "example"\npath = "/repos/example"\n',
+      );
+      expect(harnessed.config.allowedOrigins).toEqual([]);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin: 'https://ccrc.example',
+      });
+
+      expect(response.status).toBe(403);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('a configured origin does not excuse a cross-site request', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'application/json',
+        origin: 'https://ccrc.example',
+        'sec-fetch-site': 'cross-site',
+      });
+
+      expect(response.status).toBe(403);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('a configured origin still has to declare a JSON body', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await bodyOnly(harnessed, {
+        'content-type': 'text/plain',
+        origin: 'https://ccrc.example',
+      });
+
+      expect(response.status).toBe(415);
+    });
+  });
+
   test('a same-origin request and a header-less CLI request are allowed', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
 
+      // The daemon's own origin carries the configured port. `http://localhost`
+      // without one is a different origin, and is only trusted if something is
+      // reading trust out of the request rather than out of the config.
       const sameOrigin = await bodyOnly(harnessed, {
         'content-type': 'application/json',
-        origin: 'http://localhost',
+        origin: `http://localhost:${harnessed.config.port}`,
         'sec-fetch-site': 'same-origin',
       });
       expect(sameOrigin.status).toBe(201);
 
       const deleted = await harnessed.app.request('/sessions/id1', { method: 'DELETE' });
       expect(deleted.status).toBe(200);
+    });
+  });
+
+  test('a forged Host that matches a forged Origin is still refused', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      // DNS rebinding: the attacker's own hostname resolves to 127.0.0.1, so the
+      // browser sends Host and Origin that agree with each other and describe a
+      // same-origin request. Trust read out of the request would accept this.
+      const rebound = await harnessed.app.request('http://evil.example/sessions', {
+        body: JSON.stringify({ repo: 'example' }),
+        headers: {
+          'content-type': 'application/json',
+          origin: 'http://evil.example',
+          'sec-fetch-site': 'same-origin',
+        },
+        method: 'POST',
+      });
+
+      expect(rebound.status).toBe(403);
+      expect(harnessed.adapter.launches).toHaveLength(0);
+    });
+  });
+
+  test('a loopback Host on the wrong port cannot vouch for its own Origin', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      // The host check passes here — the hostname is loopback — so this isolates
+      // the origin half: trust taken from the request would compare Origin against
+      // this same forged authority and match it. Only the configured port is ours.
+      const wrongPort = await harnessed.app.request('http://127.0.0.1:9999/sessions', {
+        body: JSON.stringify({ repo: 'example' }),
+        headers: {
+          'content-type': 'application/json',
+          origin: 'http://127.0.0.1:9999',
+          'sec-fetch-site': 'same-origin',
+        },
+        method: 'POST',
+      });
+
+      expect(wrongPort.status).toBe(403);
+      expect(harnessed.adapter.launches).toHaveLength(0);
+    });
+  });
+
+  test('an unrecognised Host is refused on reads as well', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      // A rebound page can read as easily as it can write, so the host check
+      // cannot be limited to mutations.
+      const listed = await harnessed.app.request('http://evil.example/sessions');
+      expect(listed.status).toBe(403);
+
+      const repos = await harnessed.app.request('http://evil.example/repos');
+      expect(repos.status).toBe(403);
+    });
+  });
+
+  test('the configured proxy host is reachable as a Host and as an Origin', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const proxied = await harnessed.app.request('https://ccrc.example/sessions', {
+        body: JSON.stringify({ repo: 'example' }),
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://ccrc.example',
+          'sec-fetch-site': 'same-origin',
+        },
+        method: 'POST',
+      });
+
+      expect(proxied.status).toBe(201);
     });
   });
 

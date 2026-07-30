@@ -6,8 +6,12 @@ import type { Config, RepoEntry } from './config.ts';
 import { BadRequestError, CcrcError, NotFoundError, messageOf } from './errors.ts';
 import type { SessionRecord, StateStore } from './state.ts';
 
-/** A stored record plus the live detail reconciliation adds on read. */
-export type SessionView = SessionRecord & { readonly activity: SessionActivity };
+/**
+ * A stored record plus the live detail reconciliation adds on read — everything a
+ * client is told about a session. `repoPath` stays out: the console never uses it,
+ * and it is the same host path the registry summary already keeps off the wire.
+ */
+export type SessionView = Omit<SessionRecord, 'repoPath'> & { readonly activity: SessionActivity };
 
 export type LaunchInput = {
   readonly repo: string;
@@ -19,7 +23,17 @@ export type SessionListing = {
   readonly hostSessions: readonly HostSession[];
 };
 
+/**
+ * What a client is told about a registry entry. The name is all a launch needs,
+ * and the configured path stays on the host rather than being enumerable by
+ * anything that can reach the API.
+ */
+export type RepoSummary = {
+  readonly name: string;
+};
+
 export type SessionService = {
+  readonly listRepos: () => readonly RepoSummary[];
   readonly launch: (input: LaunchInput) => Promise<SessionView>;
   readonly list: () => Promise<SessionListing>;
   readonly get: (id: string) => Promise<SessionView>;
@@ -144,12 +158,17 @@ const stopIfGone = (record: SessionRecord, live: ReadonlySet<string>): SessionRe
     ? { ...record, status: 'stopped' }
     : record;
 
+const withoutRepoPath = (record: SessionRecord): Omit<SessionRecord, 'repoPath'> => {
+  const { repoPath: _repoPath, ...view } = record;
+  return view;
+};
+
 const toView = (
   record: SessionRecord,
   hostSessions: readonly HostSession[],
   records: readonly SessionRecord[],
 ): SessionView => ({
-  ...record,
+  ...withoutRepoPath(record),
   activity: ACTIVE_STATUSES.has(record.status)
     ? (correlate(record, hostSessions, records)?.status ?? 'unknown')
     : 'unknown',
@@ -303,6 +322,8 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
   };
 
+  const listRepos = (): readonly RepoSummary[] => config.repos.map((repo) => ({ name: repo.name }));
+
   const list = (): Promise<SessionListing> => reconcile();
 
   const get = async (id: string): Promise<SessionView> => {
@@ -341,8 +362,8 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         result: next,
       };
     });
-    return { ...stopped, activity: 'unknown' };
+    return { ...withoutRepoPath(stopped), activity: 'unknown' };
   };
 
-  return { get, launch, list, stop };
+  return { get, launch, list, listRepos, stop };
 };

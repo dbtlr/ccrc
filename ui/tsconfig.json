@@ -1,0 +1,7 @@
+{
+  "extends": "@dbtlr/tooling/tsconfig/react.json",
+  "compilerOptions": {
+    "noImplicitOverride": true
+  },
+  "include": ["src", "vite.config.ts"]
+}

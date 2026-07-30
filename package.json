@@ -7,9 +7,14 @@
   "bin": {
     "ccrcd": "./src/main.ts"
   },
+  "workspaces": [
+    "ui"
+  ],
   "type": "module",
   "scripts": {
+    "build": "bun run --filter ccrc-ui build",
     "dev": "bun --watch src/main.ts",
+    "dev:ui": "bun run --filter ccrc-ui dev",
     "start": "bun src/main.ts",
     "check": "vp check",
     "test": "bun test",
