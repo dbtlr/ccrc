@@ -8,9 +8,21 @@ import {
   messageOf,
 } from '../errors.ts';
 import type { LaunchInput, SessionService } from '../sessions.ts';
+import { createUiServer } from './ui.ts';
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH']);
+const READ_METHODS = new Set(['GET', 'HEAD']);
+
+/**
+ * The API owns these paths outright. The console's history fallback serves the SPA
+ * shell for anything else, and must never answer for one of them: a mistyped
+ * `/sessions/` request has to stay a JSON error rather than become a page.
+ */
+const API_PREFIXES = ['/healthz', '/repos', '/sessions'];
+
+const isApiPath = (pathname: string): boolean =>
+  API_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -80,12 +92,15 @@ const requireTrustedOrigin = (request: Request, allowedOrigins: ReadonlySet<stri
 export type AppOptions = {
   /** Exact origins, already validated by config loading. */
   readonly allowedOrigins?: readonly string[];
+  /** Where the built console lives. Omitted, the app is the JSON API alone. */
+  readonly uiDir?: string | undefined;
 };
 
 /** Wires the JSON API onto a session service. Nothing here knows about tmux. */
 export const createApp = (service: SessionService, options: AppOptions = {}): Hono => {
   const app = new Hono();
   const allowedOrigins = new Set(options.allowedOrigins);
+  const ui = options.uiDir === undefined ? undefined : createUiServer(options.uiDir);
 
   // Response.json rather than context.json: the numeric status carried by the
   // failure needs no narrowing to Hono's status-code union. Only deliberate
@@ -130,6 +145,19 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
   app.delete('/sessions/:id', async (context) =>
     context.json(await service.stop(context.req.param('id'))),
   );
+
+  /**
+   * The console is a single-page app, so its routes only exist in the browser. Every
+   * unmatched read that is not an API path gets the shell and lets the router sort it
+   * out; everything else stays a JSON failure in the shape clients already parse.
+   */
+  app.notFound((context) => {
+    const { method, path } = context.req;
+    if (ui === undefined || isApiPath(path) || !READ_METHODS.has(method)) {
+      return context.json({ error: 'not found' }, 404);
+    }
+    return ui.serve(path);
+  });
 
   return app;
 };

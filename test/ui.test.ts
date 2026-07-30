@@ -1,0 +1,186 @@
+import { describe, expect, test } from 'bun:test';
+import { join } from 'node:path';
+
+import { loadConfig, stateFilePath } from '../src/config.ts';
+import { createApp } from '../src/http/app.ts';
+import { createSessionService } from '../src/sessions.ts';
+import { createStateStore } from '../src/state.ts';
+import { fakeAdapter, withTempDir } from './support.ts';
+
+const SHELL = '<!doctype html><html><body><div id="board"></div></body></html>';
+
+type Served = {
+  readonly app: ReturnType<typeof createApp>;
+  readonly uiDir: string;
+};
+
+/** A stand-in for `ui/dist`: a shell, one hashed asset, and nothing else. */
+const withBuiltUi = async (dir: string, build: 'present' | 'absent'): Promise<Served> => {
+  const configPath = join(dir, 'config.toml');
+  await Bun.write(
+    configPath,
+    'bind = "127.0.0.1"\n\n[[repos]]\nname = "example"\npath = "/repos"\n',
+  );
+  const config = await loadConfig({ CCRC_CONFIG: configPath }, join(dir, 'home'));
+  const uiDir = join(dir, 'dist');
+  if (build === 'present') {
+    await Bun.write(join(uiDir, 'index.html'), SHELL);
+    await Bun.write(join(uiDir, 'assets', 'index-abc123.js'), 'export const board = 1;\n');
+    await Bun.write(join(uiDir, 'assets', 'index-abc123.css'), ':root { color: red }\n');
+  }
+  await Bun.write(join(dir, 'secret.txt'), 'not part of the build\n');
+  const service = createSessionService({
+    adapter: fakeAdapter(),
+    config,
+    host: 'test-host',
+    store: createStateStore(stateFilePath(config)),
+  });
+  return { app: createApp(service, { uiDir }), uiDir };
+};
+
+describe('serving the console', () => {
+  test('answers the root path with the SPA shell', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const response = await app.request('/');
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('text/html');
+      expect(await response.text()).toContain('id="board"');
+    });
+  });
+
+  test('serves hashed assets immutably and with their own content type', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const script = await app.request('/assets/index-abc123.js');
+      expect(script.status).toBe(200);
+      expect(script.headers.get('content-type')).toContain('javascript');
+      expect(script.headers.get('cache-control')).toContain('immutable');
+
+      const styles = await app.request('/assets/index-abc123.css');
+      expect(styles.headers.get('content-type')).toContain('text/css');
+    });
+  });
+
+  test('the shell is never cached, so it cannot name assets that are gone', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const response = await app.request('/');
+
+      expect(response.headers.get('cache-control')).toBe('no-cache');
+    });
+  });
+
+  // A deep link typed into Safari has to reach the router, not a 404.
+  test.each(['/board', '/sessions-view/deep/link', '/repos-picker'])(
+    'falls back to the shell for the client-side route %s',
+    async (path) => {
+      await withTempDir(async (dir) => {
+        const { app } = await withBuiltUi(dir, 'present');
+
+        const response = await app.request(path);
+
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain('id="board"');
+      });
+    },
+  );
+
+  test.each([
+    '/healthz',
+    '/repos',
+    '/sessions',
+    '/sessions/absent',
+    '/sessions/absent/anything',
+    '/healthz/extra',
+  ])('the fallback does not shadow the API path %s', async (path) => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const response = await app.request(path);
+      const body = await response.text();
+
+      expect(body).not.toContain('id="board"');
+      expect(response.headers.get('content-type')).toContain('application/json');
+    });
+  });
+
+  test('an unmatched mutation stays a JSON failure', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const response = await app.request('/board', {
+        body: '{}',
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      });
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'not found' });
+    });
+  });
+
+  test('a fingerprinted asset that is gone is a 404, not the shell', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const response = await app.request('/assets/index-stale.js');
+
+      expect(response.status).toBe(404);
+      expect(response.headers.get('content-type')).not.toContain('text/html');
+    });
+  });
+
+  test.each([
+    '/../secret.txt',
+    '/assets/../../secret.txt',
+    '/%2e%2e/secret.txt',
+    '/..%2f..%2fsecret.txt',
+  ])('refuses to serve %s from outside the build', async (path) => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const response = await app.request(path);
+      const body = await response.text();
+
+      expect(body).not.toContain('not part of the build');
+    });
+  });
+
+  test('explains an unbuilt console instead of crashing on it', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'absent');
+
+      const response = await app.request('/');
+
+      expect(response.status).toBe(503);
+      expect(await response.text()).toContain('bun run build');
+      // The API is unaffected by a missing build.
+      expect((await app.request('/healthz')).status).toBe(200);
+    });
+  });
+
+  test('the API alone is served when no build directory is configured', async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, 'config.toml');
+      await Bun.write(configPath, 'bind = "127.0.0.1"\n');
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, join(dir, 'home'));
+      const app = createApp(
+        createSessionService({
+          adapter: fakeAdapter(),
+          config,
+          store: createStateStore(stateFilePath(config)),
+        }),
+      );
+
+      const response = await app.request('/');
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'not found' });
+    });
+  });
+});

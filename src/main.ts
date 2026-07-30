@@ -3,6 +3,7 @@ import { createClaudeAdapter } from './adapter/claude.ts';
 import { loadConfig, stateFilePath } from './config.ts';
 import { messageOf } from './errors.ts';
 import { createApp } from './http/app.ts';
+import { defaultUiDir } from './http/ui.ts';
 import { createSessionService } from './sessions.ts';
 import { createStateStore } from './state.ts';
 
@@ -15,7 +16,10 @@ const start = async (): Promise<void> => {
   });
 
   const server = Bun.serve({
-    fetch: createApp(service, { allowedOrigins: config.allowedOrigins }).fetch,
+    fetch: createApp(service, {
+      allowedOrigins: config.allowedOrigins,
+      uiDir: Bun.env.CCRC_UI_DIR ?? defaultUiDir(),
+    }).fetch,
     hostname: config.bind,
     port: config.port,
   });
