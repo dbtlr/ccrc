@@ -2,13 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import { mkdir, readdir, realpath, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import type { CommandResult, CommandRunner } from '../src/adapter/claude.ts';
 import { createWorkspaceAdapter } from '../src/adapter/workspaces.ts';
 import type { WorkspaceAdapter } from '../src/adapter/workspaces.ts';
 import { loadConfig } from '../src/config.ts';
 import type { Config } from '../src/config.ts';
 import { BadRequestError, ConflictError, NotFoundError, WorkspaceError } from '../src/errors.ts';
 import { createRepoRegistry, createWorkspaceService } from '../src/workspaces.ts';
-import { capturingLogger, failed, ok, recordingRunner, rejection, withTempDir } from './support.ts';
+import { capturingLogger, failed, ok, rejection, withTempDir } from './support.ts';
 import type { CapturedLog } from './support.ts';
 
 const configWithRoot = (root: string): string => `workspaces_root = "${root}"
@@ -32,22 +33,33 @@ type Harness = {
  */
 const harness = async (
   dir: string,
-  options: { readonly configToml?: string; readonly git?: 'ok' | 'init-fails' } = {},
+  options: {
+    readonly configToml?: string;
+    readonly git?: 'ok' | 'init-fails';
+    readonly run?: CommandRunner;
+  } = {},
 ): Promise<Harness> => {
   const root = join(dir, 'workspaces');
   const configPath = join(dir, 'config.toml');
   await Bun.write(configPath, options.configToml ?? configWithRoot(root));
   const config = await loadConfig({ CCRC_CONFIG: configPath }, join(dir, 'home'));
-  const recording = recordingRunner((argv) =>
-    options.git === 'init-fails' && argv.includes('init')
-      ? failed('fatal: could not create leading directories')
-      : ok(),
-  );
+  const calls: string[][] = [];
+  /** Stands in for git closely enough to matter: `init` leaves a `.git` behind. */
+  const run: CommandRunner = async (argv) => {
+    calls.push([...argv]);
+    if (argv.includes('init')) {
+      if (options.git === 'init-fails') {
+        return failed('fatal: could not create leading directories');
+      }
+      await mkdir(join(argv[2] ?? '', '.git'), { recursive: true });
+    }
+    return ok();
+  };
   const log = capturingLogger();
   return {
-    adapter: createWorkspaceAdapter({ logger: log.logger, run: recording.run }),
+    adapter: createWorkspaceAdapter({ logger: log.logger, run: options.run ?? run }),
     config,
-    gitCalls: () => recording.calls,
+    gitCalls: () => calls,
     log,
     root,
   };
@@ -186,12 +198,16 @@ describe('workspace creation', () => {
         path: join(await realpath(harnessed.root), 'new-idea'),
       });
       expect(await readdir(harnessed.root)).toEqual(['new-idea']);
+      // git ran somewhere else entirely: the final name only ever holds a finished
+      // workspace, so the scan cannot offer a half-made one.
       const [init, commit] = harnessed.gitCalls();
-      expect(init).toEqual(['git', '-C', created.path, 'init', '-q']);
+      const staged = init?.[2] ?? '';
+      expect(staged).toMatch(/\/\.new-idea\.creating-[\da-f]{8}$/);
+      expect(init).toEqual(['git', '-C', staged, 'init', '-q']);
       expect(commit).toEqual([
         'git',
         '-C',
-        created.path,
+        staged,
         '-c',
         'user.name=ccrcd',
         '-c',
@@ -374,55 +390,68 @@ describe('workspace creation', () => {
     });
   });
 
-  test('refuses a created directory that did not land inside the root', async () => {
+  test('creates inside a symlinked root, resolving through the link', async () => {
     await withTempDir(async (dir) => {
-      const harnessed = await harness(dir);
-      const removed: string[] = [];
-      // What a symlink racing into place under the root would look like: the mkdir
-      // succeeds, and the real path it resolves to is somewhere else entirely.
-      const elsewhere: WorkspaceAdapter = {
-        ...harnessed.adapter,
-        createDirectory: () => Promise.resolve(join(dir, 'outside', 'escaped')),
-        removeIfPristine: (path) => {
-          removed.push(path);
-          return Promise.resolve(true);
-        },
-      };
-      const service = createWorkspaceService({
-        adapter: elsewhere,
-        config: harnessed.config,
-        logger: harnessed.log.logger,
+      // The root the operator configured is a link; everything real lives elsewhere.
+      const real = join(dir, 'real-workspaces');
+      await mkdir(real);
+      await symlink(real, join(dir, 'linked-root'));
+      const harnessed = await harness(dir, {
+        configToml: `workspaces_root = "${join(dir, 'linked-root')}"\n`,
       });
-
-      const failure = await rejection(service.create('escaped'));
-
-      expect(failure).toBeInstanceOf(BadRequestError);
-      expect(failure.message).toMatch(/inside the workspaces root/);
-      expect(removed).toEqual([join(dir, 'outside', 'escaped')]);
-      expect(harnessed.gitCalls()).toEqual([]);
-    });
-  });
-
-  test('keeps git output out of the response and puts it in the log', async () => {
-    await withTempDir(async (dir) => {
-      const harnessed = await harness(dir, { git: 'init-fails' });
       const service = createWorkspaceService({
         adapter: harnessed.adapter,
         config: harnessed.config,
         logger: harnessed.log.logger,
       });
 
-      const failure = await rejection(service.create('doomed'));
+      const created = await service.create('through-link');
 
-      // The client is told what failed, never where or how: git quotes host paths
-      // and command lines into stderr, and this is the same rule /healthz follows.
-      expect(failure.message).toBe('git could not initialise the workspace');
-      expect(harnessed.log.errors.join('')).toMatch(/could not create leading directories/);
-      expect(harnessed.log.errors.join('')).toMatch(/doomed/);
+      // Containment is judged against the root's real path, so the link is followed
+      // once and the workspace lands in the directory it actually names.
+      expect(created.path).toBe(join(await realpath(real), 'through-link'));
+      expect(await readdir(real)).toEqual(['through-link']);
     });
   });
 
-  test('removes the directory it made when git cannot initialise it', async () => {
+  test('does not offer a half-made workspace to the scan', async () => {
+    await withTempDir(async (dir) => {
+      // `git init` hangs: the window in which a directory exists but is not yet a
+      // workspace. Anything the scan lists in that window is launchable, and a
+      // failure would then delete the working directory of a live session.
+      const initialising = Promise.withResolvers<CommandResult>();
+      const harnessed = await harness(dir, {
+        run: (argv) => (argv.includes('init') ? initialising.promise : Promise.resolve(ok())),
+      });
+      const service = createWorkspaceService({
+        adapter: harnessed.adapter,
+        config: harnessed.config,
+        logger: harnessed.log.logger,
+      });
+      const registry = createRepoRegistry({
+        adapter: harnessed.adapter,
+        config: harnessed.config,
+        logger: harnessed.log.logger,
+      });
+
+      const creating = service.create('slow');
+      await Bun.sleep(1);
+
+      expect((await registry.list()).map((entry) => entry.name)).toEqual(['example']);
+      // It is staged under a name the scan skips, not under the name it will have.
+      const staged = await readdir(harnessed.root);
+      expect(staged).toHaveLength(1);
+      expect(staged[0]).toMatch(/^\.slow\.creating-/);
+
+      initialising.resolve(ok());
+      await creating;
+
+      expect((await registry.list()).map((entry) => entry.name)).toEqual(['example', 'slow']);
+      expect(await readdir(harnessed.root)).toEqual(['slow']);
+    });
+  });
+
+  test('leaves nothing under the root when git fails', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, { git: 'init-fails' });
       const service = createWorkspaceService({
@@ -434,36 +463,32 @@ describe('workspace creation', () => {
       const failure = await rejection(service.create('doomed'));
 
       expect(failure).toBeInstanceOf(WorkspaceError);
-      expect(failure.message).toMatch(/git could not initialise/);
-      // A directory left behind would be launchable on the next scan.
+      // No staging left, and above all nothing at the name a launch would accept.
       expect(await readdir(harnessed.root)).toEqual([]);
-      expect(harnessed.log.errors.join('')).toMatch(/removed the directory it had made/);
     });
   });
 
-  test('keeps a directory that turned out to hold something', async () => {
+  test('discards the staging directory whatever landed in it', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, { git: 'init-fails' });
-      // Something of the operator's lands in the new directory before the failure —
-      // deleting it to tidy up would be the worse mistake.
-      const busy: WorkspaceAdapter = {
+      // Staging was never launchable, so unlike a real workspace there is nothing to
+      // be careful about: it goes, contents and all.
+      const messy: WorkspaceAdapter = {
         ...harnessed.adapter,
         initRepo: async (path) => {
-          await writeFile(join(path, 'notes.md'), 'work in progress\n');
+          await writeFile(join(path, 'half-written.md'), 'partial\n');
           await harnessed.adapter.initRepo(path);
         },
       };
       const service = createWorkspaceService({
-        adapter: busy,
+        adapter: messy,
         config: harnessed.config,
         logger: harnessed.log.logger,
       });
 
-      const failure = await rejection(service.create('busy'));
+      await rejection(service.create('messy'));
 
-      expect(failure).toBeInstanceOf(WorkspaceError);
-      expect(await readdir(join(harnessed.root, 'busy'))).toEqual(['notes.md']);
-      expect(harnessed.log.errors.join('')).toMatch(/left the directory in place/);
+      expect(await readdir(harnessed.root)).toEqual([]);
     });
   });
 });

@@ -1,4 +1,4 @@
-import { lstat, mkdir, readdir, realpath, rm } from 'node:fs/promises';
+import { lstat, mkdir, readdir, realpath, rename, rm } from 'node:fs/promises';
 
 import { ConflictError, WorkspaceError } from '../errors.ts';
 import { createLogger } from '../log.ts';
@@ -27,8 +27,10 @@ export type WorkspaceAdapter = {
   readonly createDirectory: (path: string) => Promise<string>;
   /** `git init` plus one empty initial commit. */
   readonly initRepo: (path: string) => Promise<void>;
-  /** Removes a directory that holds nothing but `.git`; reports whether it did. */
-  readonly removeIfPristine: (path: string) => Promise<boolean>;
+  /** Moves a finished workspace onto its final name; a taken name is a conflict. */
+  readonly publish: (from: string, to: string) => Promise<string>;
+  /** Removes a staging directory and everything in it. Never throws. */
+  readonly discard: (path: string) => Promise<void>;
 };
 
 export type WorkspaceAdapterOptions = {
@@ -144,20 +146,39 @@ const createDirectory = async (path: string): Promise<string> => {
 };
 
 /**
- * Cleanup after a failed creation, and deliberately timid about it: a directory
- * holding anything beyond `.git` is not one ccrcd made a moment ago, and deleting
- * an operator's files to tidy up after itself is the worse mistake.
+ * Puts a finished workspace under the name it was asked for, in one step.
+ *
+ * `rename` inside one filesystem is atomic, so there is no moment where the final
+ * name exists but holds something unfinished — which is the whole reason creation
+ * happens somewhere else first. A target that is already a non-empty directory makes
+ * this fail, and that failure is a name someone else took, not a broken host.
  */
-const removeIfPristine = async (path: string): Promise<boolean> => {
+const publish = async (from: string, to: string): Promise<string> => {
   try {
-    const entries = await readdir(path);
-    if (entries.some((entry) => entry !== '.git')) {
-      return false;
+    await rename(from, to);
+  } catch (cause) {
+    const code = errorCode(cause);
+    if (code === 'EEXIST' || code === 'ENOTEMPTY' || code === 'EISDIR') {
+      throw new ConflictError('that workspace already exists');
     }
+    throw new WorkspaceError(
+      `the workspace could not be put in place (${code ?? 'unknown error'})`,
+    );
+  }
+  return realpath(to);
+};
+
+/**
+ * Staging is ccrcd's own scratch directory under a name the scan skips, so unlike a
+ * real workspace there is never a question of whether it is safe to delete: it was
+ * never launchable and nothing else knows it exists.
+ */
+const discard = async (path: string): Promise<void> => {
+  try {
     await rm(path, { force: true, recursive: true });
-    return true;
   } catch {
-    return false;
+    // Best effort. The staging name is unique and invisible to the scan, so the
+    // worst case is one stray directory rather than a workspace nobody meant.
   }
 };
 
@@ -192,5 +213,5 @@ export const createWorkspaceAdapter = (options: WorkspaceAdapterOptions = {}): W
     }
   };
 
-  return { createDirectory, exists, initRepo, listDirectories, prepareRoot, removeIfPristine };
+  return { createDirectory, discard, exists, initRepo, listDirectories, prepareRoot, publish };
 };

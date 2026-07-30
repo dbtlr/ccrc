@@ -140,14 +140,22 @@ export const createWorkspaceService = (options: WorkspaceServiceOptions): Worksp
   const logger = options.logger ?? createLogger();
 
   /**
-   * Creating a workspace is: make the directory, make it a git repo, and leave one
-   * empty commit behind so a session has a history to work against from its first
-   * turn.
+   * Creating a workspace is: make the directory, make it a git repo, leave one empty
+   * commit behind so a session has a history to work against from its first turn —
+   * and only then let it have the name it was asked for.
    *
-   * The containment check is done against the root's *real* path and repeated
-   * against the created directory's, so a symlinked root and a symlink racing into
-   * place both land inside the directory the operator named rather than somewhere
-   * a name was able to point.
+   * That last part is the point of the staging directory. The scan is the registry,
+   * so a directory sitting at the final name is launchable the instant it exists,
+   * including while `git init` is still running and including when that fails; a
+   * session launched into it would then have its working directory deleted by the
+   * cleanup. Staging is dotted, which the scan skips, so the name appears only when
+   * there is a finished workspace behind it, and cleanup only ever removes a
+   * directory nothing could have launched into.
+   *
+   * The containment check is done against the root's *real* path and repeated on the
+   * published path, so a symlinked root and a symlink racing into place both land
+   * inside the directory the operator named rather than somewhere a name was able to
+   * point.
    */
   const create = async (rawName: string): Promise<WorkspaceSummary> => {
     const root = config.workspacesRoot;
@@ -170,27 +178,29 @@ export const createWorkspaceService = (options: WorkspaceServiceOptions): Worksp
       throw new ConflictError(`workspace "${name}" already exists`);
     }
 
-    const created = await adapter.createDirectory(target);
-    if (dirname(created) !== realRoot) {
-      await adapter.removeIfPristine(created);
-      throw new BadRequestError(`"${name}" does not name a directory inside the workspaces root`);
-    }
-
+    const staging = join(realRoot, `.${name}.creating-${crypto.randomUUID().slice(0, 8)}`);
+    const created = await adapter.createDirectory(staging);
     try {
+      if (dirname(created) !== realRoot) {
+        throw new BadRequestError(`"${name}" does not name a directory inside the workspaces root`);
+      }
       await adapter.initRepo(created);
+      // Checked again on the way out: the gap between the first check and here is
+      // exactly long enough for a `git clone` to have taken the name.
+      if (await adapter.exists(target)) {
+        throw new ConflictError(`workspace "${name}" already exists`);
+      }
+      const published = await adapter.publish(created, target);
+      if (dirname(published) !== realRoot) {
+        throw new BadRequestError(`"${name}" does not name a directory inside the workspaces root`);
+      }
+      logger.info(`ccrcd created workspace "${name}"`);
+      return { name, path: published };
     } catch (cause) {
-      // A directory left behind here would be launchable on the next scan while
-      // being no kind of repo, so it goes if it is still nothing but what ccrcd
-      // just made.
-      const removed = await adapter.removeIfPristine(created);
-      logger.error(
-        `ccrcd could not initialise workspace "${name}"${removed ? ' and removed the directory it had made' : ', and left the directory in place because it was not empty'}: ${messageOf(cause)}`,
-      );
+      await adapter.discard(created);
+      logger.error(`ccrcd could not create workspace "${name}": ${messageOf(cause)}`);
       throw cause;
     }
-
-    logger.info(`ccrcd created workspace "${name}"`);
-    return { name, path: created };
   };
 
   return { create };
