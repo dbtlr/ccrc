@@ -7,9 +7,10 @@ import { toolingConfig } from '@dbtlr/tooling';
  *
  * The adapter boundary is structural: only `src/adapter/**` may shell out to
  * `claude`/`tmux` or touch `~/.claude.json`, so everything outside it is barred
- * from importing `node:child_process` and the Bun/Node filesystem modules it
- * needs for that job. The state store is the one other module allowed to write
- * files, and it does so through `Bun.file`/`Bun.write` rather than `node:fs`.
+ * from importing `node:child_process` and the Node filesystem module it needs for
+ * that job. `src/files.ts` is the single exception on the filesystem side: it is
+ * the path-agnostic atomic-write primitive (tmp file, preserved mode, rename)
+ * that both the adapter and the state store go through, and it reaches no CLI.
  */
 export default toolingConfig({
   lint: {
@@ -34,14 +35,27 @@ export default toolingConfig({
                     'Process spawning belongs to src/adapter/** — the single module allowed to reach the claude CLI and tmux.',
                   name: 'node:child_process',
                 },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        excludeFiles: ['src/adapter/**', 'src/files.ts'],
+        files: ['src/**'],
+        rules: {
+          'no-restricted-imports': [
+            'error',
+            {
+              paths: [
                 {
                   message:
-                    'Direct node:fs use belongs to src/adapter/** (which owns ~/.claude.json); other modules persist state through the state store.',
+                    'File writing goes through src/files.ts (atomic, mode-preserving); src/adapter/** owns ~/.claude.json.',
                   name: 'node:fs',
                 },
                 {
                   message:
-                    'Direct node:fs use belongs to src/adapter/** (which owns ~/.claude.json); other modules persist state through the state store.',
+                    'File writing goes through src/files.ts (atomic, mode-preserving); src/adapter/** owns ~/.claude.json.',
                   name: 'node:fs/promises',
                 },
               ],

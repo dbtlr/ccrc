@@ -8,6 +8,7 @@ import type {
   CommandRunner,
   HostSession,
   LaunchRequest,
+  StopOutcome,
 } from '../src/adapter/claude.ts';
 
 export const ok = (stdout = ''): CommandResult => ({ exitCode: 0, stderr: '', stdout });
@@ -78,6 +79,10 @@ export type FakeAdapter = ClaudeAdapter & {
   liveNames: string[];
   hostSessions: HostSession[];
   attachUrl: string | Error;
+  stopOutcome: StopOutcome | Error;
+  trustFailure: Error | null;
+  /** Awaited before every `listHostSessions`, to interleave requests on purpose. */
+  listDelay: () => Promise<void>;
 };
 
 export const hostSession = (overrides: Partial<HostSession> = {}): HostSession => ({
@@ -100,7 +105,6 @@ export const fakeAdapter = (): FakeAdapter => {
   const adapter: FakeAdapter = {
     attachUrl: 'https://claude.ai/code/session_abc123',
     hostSessions: [],
-    isSessionAlive: (tmuxName) => Promise.resolve(adapter.liveNames.includes(tmuxName)),
     launchSession: (request) => {
       launches.push(request);
       if (adapter.attachUrl instanceof Error) {
@@ -110,16 +114,28 @@ export const fakeAdapter = (): FakeAdapter => {
       return Promise.resolve(adapter.attachUrl);
     },
     launches,
-    listHostSessions: () => Promise.resolve(adapter.hostSessions),
+    listDelay: () => Promise.resolve(),
+    listHostSessions: async () => {
+      await adapter.listDelay();
+      return adapter.hostSessions;
+    },
     liveNames: [],
     liveSessionNames: () => Promise.resolve(adapter.liveNames),
+    stopOutcome: 'stopped',
     stopSession: (tmuxName) => {
+      if (adapter.stopOutcome instanceof Error) {
+        return Promise.reject(adapter.stopOutcome);
+      }
       stopped.push(tmuxName);
       adapter.liveNames = adapter.liveNames.filter((name) => name !== tmuxName);
-      return Promise.resolve();
+      return Promise.resolve(adapter.stopOutcome);
     },
     stopped,
-    trustRepo: (repoPath) => Promise.resolve(repoPath),
+    trustFailure: null,
+    trustRepo: (repoPath) =>
+      adapter.trustFailure === null
+        ? Promise.resolve(repoPath)
+        : Promise.reject(adapter.trustFailure),
   };
   return adapter;
 };

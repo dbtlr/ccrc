@@ -1,8 +1,10 @@
-import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 
-import { LaunchError } from '../errors.ts';
+import { LaunchError, StopError } from '../errors.ts';
+import { writeFileAtomic } from '../files.ts';
+import { createMutex } from '../mutex.ts';
 
 /**
  * The only module in ccrcd that touches the `claude` CLI, tmux, or
@@ -42,6 +44,9 @@ export type LaunchRequest = {
   readonly prompt?: string | undefined;
 };
 
+/** Whether a kill landed or found nothing to kill; any other failure throws. */
+export type StopOutcome = 'stopped' | 'absent';
+
 export type ClaudeAdapter = {
   /** Accept the trust dialog for `repoPath` up front; returns the resolved path. */
   readonly trustRepo: (repoPath: string) => Promise<string>;
@@ -49,8 +54,7 @@ export type ClaudeAdapter = {
   readonly launchSession: (request: LaunchRequest) => Promise<string>;
   /** Every claude session on this host, ccrcd-launched or not. */
   readonly listHostSessions: () => Promise<readonly HostSession[]>;
-  readonly stopSession: (tmuxName: string) => Promise<void>;
-  readonly isSessionAlive: (tmuxName: string) => Promise<boolean>;
+  readonly stopSession: (tmuxName: string) => Promise<StopOutcome>;
   /** Names of all live tmux sessions — one call instead of N liveness probes. */
   readonly liveSessionNames: () => Promise<readonly string[]>;
 };
@@ -65,9 +69,14 @@ export type AdapterOptions = {
   readonly attachUrlTimeoutMs?: number;
 };
 
-const ATTACH_URL_PATTERN = /https:\/\/claude\.ai\/code\/session_[\w-]+/;
+const ATTACH_URL_PATTERN = /https:\/\/claude\.ai\/code\/session_[\w-]+/g;
+const ATTACH_URL_PREFIX_LENGTH = 'https://claude.ai/code/session_'.length;
+const MIN_SESSION_ID_LENGTH = 8;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
+/** The URL usually lands within a few hundred ms, so the first poll is quick. */
+const FIRST_POLL_INTERVAL_MS = 150;
 const DEFAULT_URL_TIMEOUT_MS = 60_000;
+const MISSING_SESSION_PATTERN = /can't find session|no such session|no server running/i;
 
 export const defaultClaudeConfigPath = (home: string = homedir()): string =>
   join(home, '.claude.json');
@@ -125,45 +134,102 @@ const toHostSession = (value: unknown): HostSession | null => {
 /** POSIX single-quote quoting — tmux takes the session command as one shell string. */
 const shellQuote = (value: string): string => `'${value.replaceAll("'", `'\\''`)}'`;
 
+/** `--` so a prompt beginning with a dash is text, not a flag for claude. */
 const claudeCommandLine = (rcName: string, prompt?: string): string => {
   const argv = ['claude', '--remote-control', rcName, '--permission-mode', 'bypassPermissions'];
   if (prompt !== undefined && prompt.length > 0) {
-    argv.push(prompt);
+    argv.push('--', prompt);
   }
   return argv.map(shellQuote).join(' ');
 };
 
-const readJsonObject = async (path: string): Promise<Record<string, unknown>> => {
+const errorCode = (cause: unknown): string | undefined =>
+  isRecord(cause) && typeof cause.code === 'string' ? cause.code : undefined;
+
+/**
+ * Only a missing file is benign. A read error or unparseable content means the
+ * real file cannot be reproduced, and writing anyway would replace an operator's
+ * whole claude config — account state, oauth, every project entry — with the one
+ * key ccrcd wanted to add. Refusing the launch is the safe answer.
+ */
+const readClaudeConfig = async (path: string): Promise<Record<string, unknown>> => {
+  let source: string;
   try {
-    const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
-    return isRecord(parsed) ? parsed : {};
-  } catch {
-    return {};
+    source = await readFile(path, 'utf8');
+  } catch (cause) {
+    if (errorCode(cause) === 'ENOENT') {
+      return {};
+    }
+    throw new LaunchError(
+      `the claude CLI config could not be read (${errorCode(cause) ?? 'unknown error'}), so the launch was refused rather than overwrite it`,
+    );
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw new LaunchError(
+      'the claude CLI config is not valid JSON; repair it and retry — ccrcd refuses to overwrite a config it cannot read',
+    );
+  }
+  if (!isRecord(parsed)) {
+    throw new LaunchError(
+      'the claude CLI config is not a JSON object; ccrcd refuses to overwrite a config it cannot read',
+    );
+  }
+  return parsed;
+};
+
+const isTrusted = (config: Record<string, unknown>, resolvedRepoPath: string): boolean => {
+  const projects = isRecord(config.projects) ? config.projects : {};
+  const entry = projects[resolvedRepoPath];
+  return isRecord(entry) && entry.hasTrustDialogAccepted === true;
 };
 
 /**
- * Running sessions rewrite `~/.claude.json` concurrently, so this is a
- * read-modify-write done immediately before launch: unrelated top-level keys and
- * sibling project entries are preserved, and an existing entry for this repo is
- * merged into rather than replaced.
+ * One process-wide mutex: concurrent launches read-modify-write the same config,
+ * and interleaving them drops one launch's trust entry.
  */
-const writeTrust = async (path: string, resolvedRepoPath: string): Promise<void> => {
-  const current = await readJsonObject(path);
-  const projects = isRecord(current.projects) ? current.projects : {};
-  const existing = isRecord(projects[resolvedRepoPath]) ? projects[resolvedRepoPath] : {};
-  const next = {
-    ...current,
-    projects: {
-      ...projects,
-      [resolvedRepoPath]: { ...existing, hasTrustDialogAccepted: true },
-    },
-  };
-  await mkdir(dirname(path), { recursive: true });
-  const staging = `${path}.ccrcd.tmp`;
-  await writeFile(staging, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
-  await rename(staging, path);
-};
+const configMutex = createMutex();
+
+/**
+ * Read-modify-write done immediately before launch — running sessions rewrite the
+ * config too. Unrelated top-level keys and sibling project entries are preserved,
+ * an existing entry for this repo is merged into rather than replaced, and an
+ * already-trusted repo is left alone rather than rewriting the whole file.
+ */
+const writeTrust = (path: string, resolvedRepoPath: string): Promise<void> =>
+  configMutex(async () => {
+    const current = await readClaudeConfig(path);
+    if (isTrusted(current, resolvedRepoPath)) {
+      return;
+    }
+    const projects = isRecord(current.projects) ? current.projects : {};
+    const existing = isRecord(projects[resolvedRepoPath]) ? projects[resolvedRepoPath] : {};
+    const next = {
+      ...current,
+      projects: {
+        ...projects,
+        [resolvedRepoPath]: { ...existing, hasTrustDialogAccepted: true },
+      },
+    };
+    await writeFileAtomic(path, `${JSON.stringify(next, null, 2)}\n`);
+  });
+
+/** The longest plausible attach URL in a pane capture, or nothing. */
+const findAttachUrl = (paneText: string): string | undefined =>
+  [...paneText.matchAll(ATTACH_URL_PATTERN)]
+    .map((match) => match[0])
+    .filter((url) => url.length - ATTACH_URL_PREFIX_LENGTH >= MIN_SESSION_ID_LENGTH)
+    .toSorted((left, right) => right.length - left.length)[0];
+
+const tailOf = (text: string, lines = 3): string =>
+  text
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .slice(-lines)
+    .join(' / ');
 
 export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter => {
   const run = options.run ?? bunCommandRunner;
@@ -174,13 +240,24 @@ export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter
   const pollIntervalMs = options.attachUrlPollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const urlTimeoutMs = options.attachUrlTimeoutMs ?? DEFAULT_URL_TIMEOUT_MS;
 
-  const stopSession = async (tmuxName: string): Promise<void> => {
-    await run(['tmux', 'kill-session', '-t', tmuxName]);
-  };
+  const killSession = (tmuxName: string): Promise<CommandResult> =>
+    run(['tmux', 'kill-session', '-t', tmuxName]);
 
-  const isSessionAlive = async (tmuxName: string): Promise<boolean> => {
-    const result = await run(['tmux', 'has-session', '-t', tmuxName]);
-    return result.exitCode === 0;
+  /**
+   * A kill tmux refused is reported, never swallowed: a session that is still
+   * running must not be recorded as stopped, or nothing will ever revisit it.
+   */
+  const stopSession = async (tmuxName: string): Promise<StopOutcome> => {
+    const result = await killSession(tmuxName);
+    if (result.exitCode === 0) {
+      return 'stopped';
+    }
+    if (MISSING_SESSION_PATTERN.test(result.stderr)) {
+      return 'absent';
+    }
+    throw new StopError(
+      `tmux could not kill session ${tmuxName}: ${result.stderr.trim() || `exit code ${result.exitCode}`}`,
+    );
   };
 
   const liveSessionNames = async (): Promise<readonly string[]> => {
@@ -196,28 +273,62 @@ export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter
 
   /**
    * The attach URL is printed only into the session's terminal, so the pane is
-   * polled until it appears. A timeout is a failed launch: the tmux session is
-   * killed so no orphan is left behind. Recursion rather than a loop keeps the
-   * inherently sequential polling free of an await-in-loop suppression.
+   * polled until it appears.
+   *
+   * `-J` joins wrapped lines: without it a URL wrapped at the pane boundary
+   * matches as a truncated prefix and a broken URL gets persisted. The second
+   * capture reads the saved normal screen and its history (`-a -S -`), where the
+   * URL ends up when claude prints it before entering the alternate screen.
+   *
+   * A capture tmux refuses means the pane is gone — the command exited — which is
+   * an immediate failure rather than 60s of polling a dead session. A timeout is
+   * a failed launch too: the tmux session is killed so no orphan is left behind.
+   * Recursion rather than a loop keeps the inherently sequential polling free of
+   * an await-in-loop suppression.
    */
   const captureAttachUrl = async (tmuxName: string): Promise<string> => {
     const deadline = now() + urlTimeoutMs;
-    const poll = async (attempts: number): Promise<string> => {
-      const pane = await run(['tmux', 'capture-pane', '-t', tmuxName, '-p']);
-      const found = ATTACH_URL_PATTERN.exec(pane.stdout);
-      if (found !== null) {
-        return found[0];
-      }
-      if (now() >= deadline) {
-        await stopSession(tmuxName);
+    const poll = async (attempts: number, lastOutput: string): Promise<string> => {
+      const pane = await run(['tmux', 'capture-pane', '-p', '-J', '-t', tmuxName]);
+      if (pane.exitCode !== 0) {
+        await killSession(tmuxName);
         throw new LaunchError(
-          `no attach URL appeared in tmux session ${tmuxName} within ${urlTimeoutMs}ms (${attempts} polls); the tmux session was killed`,
+          `the session ${tmuxName} exited before printing an attach URL: ${pane.stderr.trim() || lastOutput || 'no output'}`,
         );
       }
-      await sleep(pollIntervalMs);
-      return poll(attempts + 1);
+      const visible = findAttachUrl(pane.stdout);
+      if (visible !== undefined) {
+        return visible;
+      }
+      const history = await run([
+        'tmux',
+        'capture-pane',
+        '-p',
+        '-J',
+        '-q',
+        '-a',
+        '-S',
+        '-',
+        '-t',
+        tmuxName,
+      ]);
+      const buried = findAttachUrl(history.stdout);
+      if (buried !== undefined) {
+        return buried;
+      }
+      const output = tailOf(pane.stdout) || lastOutput;
+      if (now() >= deadline) {
+        await killSession(tmuxName);
+        throw new LaunchError(
+          `no attach URL appeared in tmux session ${tmuxName} within ${urlTimeoutMs}ms (${attempts} polls); the tmux session was killed. Last pane output: ${output || 'none'}`,
+        );
+      }
+      await sleep(
+        attempts === 1 ? Math.min(FIRST_POLL_INTERVAL_MS, pollIntervalMs) : pollIntervalMs,
+      );
+      return poll(attempts + 1, output);
     };
-    return poll(1);
+    return poll(1, '');
   };
 
   const launchSession = async (request: LaunchRequest): Promise<string> => {
@@ -263,7 +374,6 @@ export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter
   };
 
   return {
-    isSessionAlive,
     launchSession,
     listHostSessions,
     liveSessionNames,

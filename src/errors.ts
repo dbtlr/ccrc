@@ -17,6 +17,22 @@ export class BadRequestError extends CcrcError {
   }
 }
 
+/** A mutating request that did not prove it came from a same-origin caller. */
+export class ForbiddenError extends CcrcError {
+  constructor(message: string) {
+    super(message, 403);
+    this.name = 'ForbiddenError';
+  }
+}
+
+/** A mutating request whose body was not declared as JSON. */
+export class UnsupportedMediaTypeError extends CcrcError {
+  constructor(message: string) {
+    super(message, 415);
+    this.name = 'UnsupportedMediaTypeError';
+  }
+}
+
 /** Unknown repo name or unknown session id. */
 export class NotFoundError extends CcrcError {
   constructor(message: string) {
@@ -30,6 +46,14 @@ export class LaunchError extends CcrcError {
   constructor(message: string) {
     super(message, 502);
     this.name = 'LaunchError';
+  }
+}
+
+/** A kill that tmux refused for a reason other than "no such session". */
+export class StopError extends CcrcError {
+  constructor(message: string) {
+    super(message, 502);
+    this.name = 'StopError';
   }
 }
 
