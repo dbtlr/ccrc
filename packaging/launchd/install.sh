@@ -33,29 +33,43 @@ if [ -z "${bun}" ]; then
   echo "bun is not on PATH; install it first: https://bun.sh" >&2
   exit 1
 fi
+# command -v echoes whatever spelling found the binary; ProgramArguments needs an
+# absolute path, since launchd starts the job from its own working directory.
+bun="$(cd "$(dirname "${bun}")" && pwd -P)/$(basename "${bun}")"
 
-# The agent runs with the PATH captured here and inherits nothing else, so the tools
-# ccrcd shells out to have to be findable in it. Otherwise the daemon comes up, reports
-# itself unwell, and fails every launch.
+# The agent runs with the PATH captured here and inherits nothing else. Relative
+# entries would resolve against launchd's working directory, so only absolute ones
+# are baked in — and the tools ccrcd shells out to have to be findable among them.
+# Otherwise the daemon comes up, reports itself unwell, and fails every launch.
+agent_path=""
+IFS=':' read -ra path_entries <<<"${PATH}"
+for entry in "${path_entries[@]}"; do
+  case "${entry}" in
+  /*) agent_path="${agent_path:+${agent_path}:}${entry}" ;;
+  esac
+done
 for tool in tmux claude; do
-  if ! command -v "${tool}" >/dev/null 2>&1; then
+  if ! PATH="${agent_path}" command -v "${tool}" >/dev/null 2>&1; then
     echo "${tool} is not on PATH; ccrcd runs every session through it" >&2
     exit 1
   fi
 done
 
 # A missing config is a fatal startup error, and KeepAlive would turn that into a
-# restart loop. Refuse the install instead.
-if [ ! -f "${config}" ]; then
-  echo "no ccrcd config at ${config}; create it (or set CCRC_CONFIG) first" >&2
+# restart loop — and the agent runs as this same user, so a config this shell cannot
+# read is one the daemon cannot read either. Refuse the install instead.
+if [ ! -f "${config}" ] || [ ! -r "${config}" ]; then
+  echo "ccrcd config at ${config} is missing or unreadable; create it (or set CCRC_CONFIG) first" >&2
   exit 1
 fi
 
 mkdir -p "${agents_dir}" "${log_dir}"
 
 # Staged first: writing straight to the plist would truncate a working agent's
-# definition before knowing whether this render even succeeds.
-staged="$(mktemp "${TMPDIR:-/tmp}/ccrcd-plist.XXXXXX")"
+# definition before knowing whether this render even succeeds. Staged beside the
+# destination so the final rename stays on one filesystem (launchd only scans for
+# *.plist, so the dotfile staging name is never picked up).
+staged="$(mktemp "${agents_dir}/.${label}.XXXXXX")"
 trap 'rm -f "${staged}"' EXIT
 
 CCRC_TEMPLATE="${template}" \
@@ -63,7 +77,7 @@ CCRC_TEMPLATE="${template}" \
   CCRC_BUN="${bun}" \
   CCRC_REPO_DIR="${repo_dir}" \
   CCRC_HOME_DIR="${HOME}" \
-  CCRC_AGENT_PATH="${PATH}" \
+  CCRC_AGENT_PATH="${agent_path}" \
   CCRC_CONFIG_PATH="${config}" \
   CCRC_LOG_DIR="${log_dir}" \
   bash "${here}/render-plist.sh" >"${staged}"
