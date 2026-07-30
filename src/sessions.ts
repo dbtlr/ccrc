@@ -2,12 +2,13 @@ import { hostname } from 'node:os';
 
 import { WORST_CASE_LAUNCH_MS } from './adapter/claude.ts';
 import type { ClaudeAdapter, HostSession, SessionActivity } from './adapter/claude.ts';
-import { findRepo } from './config.ts';
 import type { Config, RepoEntry } from './config.ts';
 import { BadRequestError, CcrcError, NotFoundError, messageOf } from './errors.ts';
 import { createLogger } from './log.ts';
 import type { Logger } from './log.ts';
 import type { SessionRecord, StateStore } from './state.ts';
+import { createRepoRegistry } from './workspaces.ts';
+import type { RepoRegistry } from './workspaces.ts';
 
 /**
  * A stored record plus the live detail reconciliation adds on read — everything a
@@ -48,7 +49,7 @@ export type HangOutcome = {
 };
 
 export type SessionService = {
-  readonly listRepos: () => readonly RepoSummary[];
+  readonly listRepos: () => Promise<readonly RepoSummary[]>;
   readonly launch: (input: LaunchInput) => Promise<SessionView>;
   readonly list: () => Promise<SessionListing>;
   readonly get: (id: string) => Promise<SessionView>;
@@ -65,6 +66,11 @@ export type SessionServiceOptions = {
   readonly adapter: ClaudeAdapter;
   readonly store: StateStore;
   readonly config: Config;
+  /**
+   * Where a repo name is resolved. Omitted, it is the config's `[[repos]]` alone —
+   * the same registry ccrcd had before anything was scanned.
+   */
+  readonly registry?: RepoRegistry;
   readonly host?: string;
   readonly now?: () => number;
   readonly generateId?: () => string;
@@ -307,6 +313,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   const now = options.now ?? Date.now;
   const generateId = options.generateId ?? randomId;
   const logger = options.logger ?? createLogger();
+  const registry = options.registry ?? createRepoRegistry({ config, logger });
 
   /**
    * A tmux that will not say which sessions are live makes liveness indeterminate,
@@ -564,7 +571,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     if (typeof input.repo !== 'string' || input.repo.length === 0) {
       throw new BadRequestError('"repo" is required and must be a registry repo name');
     }
-    const repo = findRepo(config, input.repo);
+    const repo = await registry.find(input.repo);
     if (repo === undefined) {
       throw new NotFoundError(`unknown repo "${input.repo}"`);
     }
@@ -573,7 +580,13 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return toView(started.record, started.hostSessions, started.records);
   };
 
-  const listRepos = (): readonly RepoSummary[] => config.repos.map((repo) => ({ name: repo.name }));
+  /**
+   * Scanned on every read rather than remembered: a workspace created a moment ago —
+   * by ccrcd, by `git clone`, or by hand — is launchable immediately, and nothing has
+   * to be kept in step with the filesystem.
+   */
+  const listRepos = async (): Promise<readonly RepoSummary[]> =>
+    (await registry.list()).map((repo) => ({ name: repo.name }));
 
   const list = (): Promise<SessionListing> => reconcile();
 
@@ -776,7 +789,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       );
       return { id: record.id, reason, restartedAs: null };
     }
-    const repo = findRepo(config, record.repoName);
+    const repo = await registry.find(record.repoName);
     if (repo === undefined) {
       const reason = `${symptom}; repo "${record.repoName}" is no longer in the registry, so it was not restarted`;
       await retire(record.id, reason, null, session);
