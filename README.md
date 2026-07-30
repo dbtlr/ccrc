@@ -52,6 +52,9 @@ port = 7433          # optional, defaults to 7433
 # optional, defaults to none — see "Behind a reverse proxy"
 allowed_origins = ["https://ccrc.example"]
 
+# optional, defaults to none — see "Workspaces"
+workspaces_root = "~/workspaces"
+
 [[repos]]
 name = "example"
 path = "~/code/example"
@@ -61,8 +64,52 @@ name = "notes"
 path = "~/notes"
 ```
 
-Only repos in this registry can be launched; `POST /sessions` takes a registry `name`, never
-a path.
+Top-level keys have to come before the first `[[repos]]` table: in TOML a key written after
+an array-of-tables header belongs to that table, not to the document.
+
+`POST /sessions` takes a `name`, never a path. Which names it accepts is the registry below.
+
+### Workspaces
+
+The launchable set is the `[[repos]]` above **plus every directory directly under
+`workspaces_root`**, scanned on each request. Nothing is written down: a workspace created
+through the API, by `git clone`, or with `mkdir` is launchable the moment it exists, and
+there is no registry file to drift out of step with the disk.
+
+Say the security consequence out loud: **anything directly under that root can be launched**,
+and a launch runs with `bypassPermissions`. The root is a directory handed to the daemon
+wholesale, so it should hold work you are content for an unattended session to change — not
+`$HOME`. Three things narrow it: the scan is one level deep, it takes only real directories
+(a symlink is how something outside the root would otherwise become launchable), and it skips
+dotted names. Leave `workspaces_root` out of the config and none of this exists — no scan, no
+creation endpoint.
+
+On a name collision the configured repo wins and the shadowed directory is mentioned once in
+the log. The root itself need not exist: the first creation makes it.
+
+`POST /workspaces` creates one:
+
+```sh
+curl -s -X POST http://127.0.0.1:7433/workspaces \
+  -H 'content-type: application/json' \
+  -d '{"name":"notes-app"}'
+# {"name":"notes-app","path":"/home/you/workspaces/notes-app"}
+```
+
+The name has to be a single ordinary path segment — letters, digits, dots, dashes, and
+underscores, starting with a letter or digit, at most 64 characters, no `..` — and the
+resolved path is checked to land inside the root before anything is created. A name that is
+already a directory under the root or a configured repo answers `409`; a daemon with no
+`workspaces_root` answers `404`. Creation is a mutation, so it is held to exactly the same
+origin and content-type gates as a launch (`403`/`415`).
+
+What it creates is a directory, `git init`, and one empty commit
+(`chore: initialize workspace`) so a session has a history to work against from its first
+turn. The commit is made with an inline identity (`ccrcd <ccrcd@localhost>`) and signing off,
+because a daemon started at login has no git config of its own to fall back on. If `git`
+fails, the directory ccrcd just made is removed again rather than left behind as a
+half-initialised thing the next scan would offer to launch — unless something else has landed
+in it by then, in which case it stays and the log says so.
 
 ### Supervision settings
 
@@ -205,8 +252,9 @@ is being reconciled, watched, or pruned at all.
 
 ## Web console
 
-The daemon serves a one-screen operator console from the same port as the API: pick a repo,
-optionally give the session a first message, launch it, and watch the board. Each session
+The daemon serves a one-screen operator console from the same port as the API: pick a repo —
+or name a new workspace, which is created and launched into in one gesture — optionally give
+the session a first message, launch it, and watch the board. Each session
 shows its state, its uptime, its attach link, and a confirmed stop. It is built for a phone —
 one column, touch-sized controls, and no hover-only affordances.
 
@@ -250,8 +298,14 @@ All responses are JSON. Errors are `{ "error": "..." }` with a 4xx/5xx status.
 # health: tmux reachable, claude CLI reachable, state file writable
 curl -s http://127.0.0.1:7433/healthz
 
-# the repo names a launch will accept (paths stay on the host)
+# the names a launch will accept: configured repos plus what is under the
+# workspaces root right now (paths stay on the host)
 curl -s http://127.0.0.1:7433/repos
+
+# create a workspace under the workspaces root and git-initialise it
+curl -s -X POST http://127.0.0.1:7433/workspaces \
+  -H 'content-type: application/json' \
+  -d '{"name":"notes-app"}'
 
 # launch a session (optional first prompt, slash commands included)
 curl -s -X POST http://127.0.0.1:7433/sessions \
