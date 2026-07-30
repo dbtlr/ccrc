@@ -1015,6 +1015,38 @@ describe('idle timeout', () => {
     });
   });
 
+  test('keeps an operator stop’s own account when a DELETE lands mid-sweep', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [idleSession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 35 * MINUTE };
+      // The sweep's own kill parks; the DELETE that arrives behind it does not.
+      const killing = Promise.withResolvers<void>();
+      let first = true;
+      harnessed.adapter.stopDelay = () => {
+        if (!first) {
+          return Promise.resolve();
+        }
+        first = false;
+        return killing.promise;
+      };
+
+      const sweeping = sweepIdle(harnessed);
+      await Bun.sleep(1);
+      await harnessed.service.stop('id1');
+      killing.resolve();
+      await sweeping;
+
+      // The operator ended this session; the sweep arriving a moment later must not
+      // rewrite whose decision it was.
+      const stored = (await harnessed.store.load())[0];
+      expect(stored?.status).toBe('stopped');
+      expect(stored?.stopReason).toBeNull();
+      expect(stored?.endedAt).toBe(NOW);
+    });
+  });
+
   test('leaves the record running when tmux refuses the kill', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);

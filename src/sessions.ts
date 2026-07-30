@@ -710,7 +710,16 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { ...withoutRepoPath(stopped), activity: 'unknown' };
   };
 
-  /** Retires a record ccrcd decided to end, with the reason it decided that. */
+  /**
+   * Retires a record ccrcd decided to end, with the reason it decided that.
+   *
+   * A record something else already ended keeps that account. An operator's `DELETE`
+   * landing mid-sweep is the truth about how the session ended, and a sweep finishing
+   * a moment later must not rewrite the attribution to its own — the same rule a
+   * settling launch follows when it finds the record already terminal. ccrcd's own
+   * retirements carry a reason, so a restart rewriting its record once the
+   * replacement is known is not "something else" and still goes through.
+   */
   const retire = (
     id: string,
     reason: string,
@@ -720,6 +729,9 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     store.update((records) => {
       const current = records.find((record) => record.id === id);
       if (current === undefined) {
+        return { records, result: undefined };
+      }
+      if (TERMINAL_STATUSES.has(current.status) && current.stopReason === null) {
         return { records, result: undefined };
       }
       const next: SessionRecord = {
