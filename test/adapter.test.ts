@@ -323,6 +323,36 @@ describe('command runner', () => {
     expect(failure.message).toMatch(/sh did not finish within 20ms and was killed/);
   });
 
+  /**
+   * The descendant is the case a plain `child.kill()` misses: it inherits the
+   * stdout/stderr pipes, so signalling the direct pid alone leaves the stream reads
+   * pending forever and the runner never rejects. `wait` keeps the direct child
+   * alive too, so only a process-tree kill ends this. The marker is unique per run
+   * so the survivor check cannot match an unrelated process.
+   */
+  test('kills descendants that hold the pipes open, within the timeout', async () => {
+    const marker = `ccrc-timeout-probe-${crypto.randomUUID()}`;
+    const survivors = async (): Promise<string> =>
+      (await createBunCommandRunner(5_000)(['pgrep', '-f', marker])).stdout.trim();
+    try {
+      const started = Date.now();
+
+      const failure = await rejection(
+        createBunCommandRunner(50)(['sh', '-c', `sh -c 'sleep 30 # ${marker}' & wait`]),
+      );
+
+      expect(failure).toBeInstanceOf(CommandTimeoutError);
+      expect(failure.message).toMatch(/sh did not finish within 50ms and was killed/);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(await survivors()).toBe('');
+    } finally {
+      const leaked = await survivors();
+      if (leaked.length > 0) {
+        await createBunCommandRunner(5_000)(['pkill', '-f', marker]);
+      }
+    }
+  });
+
   test('a command that finishes inside its timeout is untouched', async () => {
     expect(await createBunCommandRunner(30_000)(['sh', '-c', 'printf done'])).toEqual({
       exitCode: 0,

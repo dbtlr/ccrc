@@ -88,14 +88,54 @@ const MISSING_SESSION_PATTERN = /can't find session|no such session|no server ru
 export const defaultClaudeConfigPath = (home: string = homedir()): string =>
   join(home, '.claude.json');
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const errorCode = (cause: unknown): string | undefined =>
+  isRecord(cause) && typeof cause.code === 'string' ? cause.code : undefined;
+
+/**
+ * SIGKILL the timed-out child and everything it spawned.
+ *
+ * `child.kill()` signals the direct pid only, so a descendant that inherited the
+ * stdout/stderr pipes keeps them open and the stream reads never settle — the very
+ * hang the timeout exists to prevent. Children are spawned `detached`, which puts
+ * each one in its own process group, so the negative-pid kill reaches the whole
+ * tree and can never reach ccrcd itself. (`Subprocess.killTree` does not exist in
+ * Bun 1.3.)
+ *
+ * A kill that finds nothing (ESRCH) is the normal race with a child exiting on its
+ * own; anything else falls back to signalling the direct pid. Neither outcome may
+ * throw — the caller is already on its way to reporting a timeout.
+ */
+const killProcessTree = (child: Bun.Subprocess): void => {
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch (cause) {
+    if (errorCode(cause) !== 'ESRCH') {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Already gone; the timeout is reported either way.
+      }
+    }
+  }
+  // The request is abandoned from here, so nothing may keep the daemon's event
+  // loop alive waiting on a child that was just killed.
+  child.unref();
+};
+
 /**
  * Spawns real processes; the default `CommandRunner` outside tests.
  *
  * Every command is bounded: a wedged tmux server or a `claude` CLI that never
  * exits would otherwise hold the HTTP request that triggered it open forever,
- * with no output to explain why. The child is killed on expiry and the timeout is
- * reported as such — the command name only, never the argv, which carries the
- * prompt.
+ * with no output to explain why. On expiry the whole process tree is killed and the
+ * timeout is reported as such — the command name only, never the argv, which
+ * carries the prompt.
+ *
+ * The timeout is raced against the output collection rather than checked after it,
+ * so the rejection lands within `timeoutMs` even if some pipe outlives the kill.
  */
 export const createBunCommandRunner =
   (timeoutMs: number = DEFAULT_COMMAND_TIMEOUT_MS): CommandRunner =>
@@ -104,31 +144,30 @@ export const createBunCommandRunner =
     if (command === undefined) {
       throw new Error('command runner received an empty argv');
     }
-    const child = Bun.spawn([command, ...args], { stderr: 'pipe', stdout: 'pipe' });
-    let expired = false;
+    const child = Bun.spawn([command, ...args], {
+      detached: true,
+      stderr: 'pipe',
+      stdout: 'pipe',
+    });
+    const collected = Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    const expiry = Promise.withResolvers<never>();
     const timer = setTimeout(() => {
-      expired = true;
-      child.kill('SIGKILL');
+      killProcessTree(child);
+      expiry.reject(
+        new CommandTimeoutError(`${command} did not finish within ${timeoutMs}ms and was killed`),
+      );
     }, timeoutMs);
     try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-      ]);
-      if (expired) {
-        throw new CommandTimeoutError(
-          `${command} did not finish within ${timeoutMs}ms and was killed`,
-        );
-      }
+      const [stdout, stderr, exitCode] = await Promise.race([collected, expiry.promise]);
       return { exitCode, stderr, stdout };
     } finally {
       clearTimeout(timer);
     }
   };
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const asString = (value: unknown): string | null => (typeof value === 'string' ? value : null);
 
@@ -173,9 +212,6 @@ const claudeCommandLine = (rcName: string, prompt?: string): string => {
   }
   return argv.map(shellQuote).join(' ');
 };
-
-const errorCode = (cause: unknown): string | undefined =>
-  isRecord(cause) && typeof cause.code === 'string' ? cause.code : undefined;
 
 /**
  * Only a missing file is benign. A read error or unparseable content means the
