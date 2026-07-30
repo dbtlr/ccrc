@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { UseMutationResult, UseQueryResult } from '@tanstack/react-query';
+import { useRef } from 'react';
 
 import { fetchRepos, fetchSessions, launchSession, stopSession } from './client.ts';
 import type { LaunchRequest, Repo, Session } from './client.ts';
@@ -12,13 +13,37 @@ const REPOS_KEY = ['repos'];
  * enough that a session's state is never stale in the hand.
  */
 const POLL_INTERVAL_MS = 3000;
+/** A dead daemon is polled at most this rarely, however long it stays down. */
+const MAX_POLL_INTERVAL_MS = 30_000;
 
-export const useSessions = (): UseQueryResult<Session[]> =>
-  useQuery({
-    queryFn: fetchSessions,
+/**
+ * Doubles the wait per consecutive failure so a dead daemon is not hammered every
+ * 3s forever, capped at `MAX_POLL_INTERVAL_MS`. Backgrounding the tab already pauses
+ * polling on its own — `refetchInterval` skips ticks while the window is unfocused
+ * unless `refetchIntervalInBackground` is set, which it is not here.
+ */
+const backoffInterval = (consecutiveFailures: number): number =>
+  Math.min(POLL_INTERVAL_MS * 2 ** consecutiveFailures, MAX_POLL_INTERVAL_MS);
+
+export const useSessions = (): UseQueryResult<Session[]> => {
+  // React Query's own failure count resets at the start of every fetch, so it
+  // cannot distinguish one failed poll from ten in a row — this can.
+  const consecutiveFailures = useRef(0);
+  return useQuery({
+    queryFn: async () => {
+      try {
+        const sessions = await fetchSessions();
+        consecutiveFailures.current = 0;
+        return sessions;
+      } catch (error) {
+        consecutiveFailures.current += 1;
+        throw error;
+      }
+    },
     queryKey: SESSIONS_KEY,
-    refetchInterval: POLL_INTERVAL_MS,
+    refetchInterval: () => backoffInterval(consecutiveFailures.current),
   });
+};
 
 /** The registry only changes when the daemon is restarted with a new config. */
 export const useRepos = (): UseQueryResult<Repo[]> =>
