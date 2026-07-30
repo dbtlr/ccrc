@@ -2,8 +2,14 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { UseMutationResult, UseQueryResult } from '@tanstack/react-query';
 import { useRef } from 'react';
 
-import { fetchRepos, fetchSessions, launchSession, stopSession } from './client.ts';
-import type { LaunchRequest, Repo, Session } from './client.ts';
+import {
+  createWorkspace,
+  fetchRepos,
+  fetchSessions,
+  launchSession,
+  stopSession,
+} from './client.ts';
+import type { LaunchRequest, Registry, Session, Workspace } from './client.ts';
 
 const SESSIONS_KEY = ['sessions'];
 const REPOS_KEY = ['repos'];
@@ -45,9 +51,21 @@ export const useSessions = (): UseQueryResult<Session[]> => {
   });
 };
 
-/** The registry only changes when the daemon is restarted with a new config. */
-export const useRepos = (): UseQueryResult<Repo[]> =>
+/**
+ * The launchable list is the config's repos plus whatever is under the workspaces
+ * root, scanned per request. It is not polled: creating a workspace here refreshes
+ * it, and a directory made outside the console appears on the next page load.
+ */
+export const useRepos = (): UseQueryResult<Registry> =>
   useQuery({ queryFn: fetchRepos, queryKey: REPOS_KEY, staleTime: Infinity });
+
+export const useCreateWorkspace = (): UseMutationResult<Workspace, Error, string> => {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: createWorkspace,
+    onSuccess: () => client.invalidateQueries({ queryKey: REPOS_KEY }),
+  });
+};
 
 export const useLaunch = (): UseMutationResult<unknown, Error, LaunchRequest> => {
   const client = useQueryClient();

@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
+import { mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { createWorkspaceAdapter } from '../src/adapter/workspaces.ts';
 import { loadConfig, stateFilePath } from '../src/config.ts';
 import type { Config } from '../src/config.ts';
 import { LaunchError, LivenessError, StopError } from '../src/errors.ts';
@@ -9,7 +11,15 @@ import { createApp } from '../src/http/app.ts';
 import { createSessionService } from '../src/sessions.ts';
 import type { SessionService } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
-import { capturingLogger, fakeAdapter, hostSession, withTempDir } from './support.ts';
+import { createRepoRegistry, createWorkspaceService } from '../src/workspaces.ts';
+import {
+  capturingLogger,
+  fakeAdapter,
+  hostSession,
+  ok,
+  recordingRunner,
+  withTempDir,
+} from './support.ts';
 import type { CapturedLog, FakeAdapter } from './support.ts';
 
 const CONFIG_TOML = `bind = "127.0.0.1"
@@ -34,6 +44,8 @@ type Harness = {
   readonly service: SessionService;
   /** Moves the service's clock, for the windows reconciliation measures in time. */
   readonly at: (ms: number) => void;
+  /** The git commands the workspace creation ran, if any. */
+  readonly gitCalls: () => string[][];
 };
 
 let sequence = 0;
@@ -46,6 +58,9 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
   const statePath = stateFilePath(config);
   const log = capturingLogger();
   let current = 1_764_000_000_000;
+  const git = recordingRunner(() => ok());
+  const workspaceAdapter = createWorkspaceAdapter({ logger: log.logger, run: git.run });
+  const registry = createRepoRegistry({ adapter: workspaceAdapter, config, logger: log.logger });
   const service = createSessionService({
     adapter,
     config,
@@ -56,6 +71,7 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
     host: 'test-host',
     logger: log.logger,
     now: () => current,
+    registry,
     store: createStateStore(statePath),
   });
   return {
@@ -65,11 +81,22 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
       health: createHealthService({ adapter, logger: log.logger, statePath }),
       logger: log.logger,
       port: config.port,
+      // Wired only when the config names a root, exactly as `main` does.
+      ...(config.workspacesRoot === null
+        ? {}
+        : {
+            workspaces: createWorkspaceService({
+              adapter: workspaceAdapter,
+              config,
+              logger: log.logger,
+            }),
+          }),
     }),
     at: (ms) => {
       current = ms;
     },
     config,
+    gitCalls: () => git.calls,
     log,
     service,
     statePath,
@@ -152,6 +179,158 @@ describe('healthz', () => {
   });
 });
 
+/**
+ * A config with a workspaces root. The key goes above the `[[repos]]` tables: in
+ * TOML a top-level key written after an array-of-tables header belongs to that
+ * table, not to the document.
+ */
+const withWorkspaces = (root: string): string => `workspaces_root = "${root}"\n${CONFIG_TOML}`;
+
+const postWorkspace = async (harnessed: Harness, body: unknown): Promise<Response> =>
+  harnessed.app.request('/workspaces', {
+    body: JSON.stringify(body),
+    headers: { 'content-type': 'application/json' },
+    method: 'POST',
+  });
+
+describe('workspace creation', () => {
+  test('creates a workspace and answers with its name and path', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      const harnessed = await harness(dir, withWorkspaces(root));
+
+      const response = await postWorkspace(harnessed, { name: 'new-idea' });
+
+      expect(response.status).toBe(201);
+      expect(await response.json()).toEqual({
+        name: 'new-idea',
+        path: join(await realpath(root), 'new-idea'),
+      });
+      expect(harnessed.gitCalls().map((argv) => argv[1])).toEqual(['-C', '-C']);
+    });
+  });
+
+  test('the new workspace is launchable immediately, by name', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      const harnessed = await harness(dir, withWorkspaces(root));
+      await postWorkspace(harnessed, { name: 'new-idea' });
+
+      const listed = (await (await harnessed.app.request('/repos')).json()) as {
+        repos: { name: string }[];
+      };
+      const launched = await postSession(harnessed, { repo: 'new-idea' });
+
+      expect(listed.repos.map((repo) => repo.name)).toEqual([
+        'example',
+        'Side Project',
+        'new-idea',
+      ]);
+      expect(launched.status).toBe(201);
+      // The session runs in the workspace, not somewhere a name happened to resolve.
+      expect(harnessed.adapter.launches[0]?.repoPath).toBe(join(root, 'new-idea'));
+    });
+  });
+
+  test.each(['../etc', 'scanned/../../etc', '.hidden', 'absent'])(
+    'refuses to launch the unlisted name %p',
+    async (repo) => {
+      await withTempDir(async (dir) => {
+        const root = join(dir, 'workspaces');
+        await mkdir(join(root, 'scanned'), { recursive: true });
+        await mkdir(join(root, '.hidden'), { recursive: true });
+        const harnessed = await harness(dir, withWorkspaces(root));
+
+        const response = await postSession(harnessed, { repo });
+
+        expect(response.status).toBe(404);
+        expect(harnessed.adapter.launches).toEqual([]);
+      });
+    },
+  );
+
+  test('answers 404 when no workspaces root is configured', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const response = await postWorkspace(harnessed, { name: 'new-idea' });
+
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({
+        error: expect.stringContaining('workspaces_root'),
+      });
+    });
+  });
+
+  test('answers 409 for a name that is already taken', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, withWorkspaces(join(dir, 'workspaces')));
+      await postWorkspace(harnessed, { name: 'twice' });
+
+      const again = await postWorkspace(harnessed, { name: 'twice' });
+      const configured = await postWorkspace(harnessed, { name: 'example' });
+
+      expect(again.status).toBe(409);
+      expect(configured.status).toBe(409);
+    });
+  });
+
+  test.each([{ name: '../escape' }, { name: 'nested/name' }, { name: '' }, { name: 7 }, {}])(
+    'answers 400 for the body %p',
+    async (body) => {
+      await withTempDir(async (dir) => {
+        const harnessed = await harness(dir, withWorkspaces(join(dir, 'workspaces')));
+
+        const response = await postWorkspace(harnessed, body);
+
+        expect(response.status).toBe(400);
+        expect(harnessed.gitCalls()).toEqual([]);
+      });
+    },
+  );
+
+  test('is held to the same gates as a launch', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, withWorkspaces(join(dir, 'workspaces')));
+
+      const formLike = await harnessed.app.request('/workspaces', {
+        body: JSON.stringify({ name: 'sneaky' }),
+        headers: { 'content-type': 'text/plain;charset=UTF-8' },
+        method: 'POST',
+      });
+      const crossOrigin = await harnessed.app.request('/workspaces', {
+        body: JSON.stringify({ name: 'sneaky' }),
+        headers: { 'content-type': 'application/json', origin: 'https://stranger.example' },
+        method: 'POST',
+      });
+      const crossSite = await harnessed.app.request('/workspaces', {
+        body: JSON.stringify({ name: 'sneaky' }),
+        headers: { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' },
+        method: 'POST',
+      });
+
+      expect(formLike.status).toBe(415);
+      expect(crossOrigin.status).toBe(403);
+      expect(crossSite.status).toBe(403);
+      expect(harnessed.gitCalls()).toEqual([]);
+    });
+  });
+
+  test('an allowed origin may create workspaces, like it may launch', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, withWorkspaces(join(dir, 'workspaces')));
+
+      const response = await harnessed.app.request('/workspaces', {
+        body: JSON.stringify({ name: 'from-proxy' }),
+        headers: { 'content-type': 'application/json', origin: 'https://ccrc.example' },
+        method: 'POST',
+      });
+
+      expect(response.status).toBe(201);
+    });
+  });
+});
+
 describe('repo registry', () => {
   test('lists the registry names the console can launch', async () => {
     await withTempDir(async (dir) => {
@@ -162,7 +341,69 @@ describe('repo registry', () => {
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({
         repos: [{ name: 'example' }, { name: 'Side Project' }],
+        workspacesUnavailable: false,
       });
+    });
+  });
+
+  test('lists workspaces found under the root alongside the configured repos', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      await mkdir(join(root, 'scanned'), { recursive: true });
+      await mkdir(join(root, '.hidden'), { recursive: true });
+      const harnessed = await harness(dir, withWorkspaces(root));
+
+      const response = await harnessed.app.request('/repos');
+
+      expect(await response.json()).toEqual({
+        repos: [{ name: 'example' }, { name: 'Side Project' }, { name: 'scanned' }],
+        workspacesUnavailable: false,
+      });
+    });
+  });
+
+  test('lists what it still knows, and says so, when the root cannot be read', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      // A file where the root should be: the scan cannot say what is launchable.
+      await Bun.write(root, 'not a directory\n');
+      const harnessed = await harness(dir, withWorkspaces(root));
+
+      const listed = await harnessed.app.request('/repos');
+
+      // The configured repos are known and still launch, so they are still offered —
+      // with the missing half named rather than passed off as an empty list.
+      expect(listed.status).toBe(200);
+      expect(await listed.json()).toEqual({
+        repos: [{ name: 'example' }, { name: 'Side Project' }],
+        workspacesUnavailable: true,
+      });
+    });
+  });
+
+  test('still refuses to launch an unlisted name while the root cannot be read', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      await Bun.write(root, 'not a directory\n');
+      const harnessed = await harness(dir, withWorkspaces(root));
+
+      const launched = await postSession(harnessed, { repo: 'anything' });
+
+      // Not "no such repo": the host would not say, and a launch may not guess.
+      expect(launched.status).toBe(502);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('still launches a configured repo when the scan is broken', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      await Bun.write(root, 'not a directory\n');
+      const harnessed = await harness(dir, withWorkspaces(root));
+
+      const launched = await postSession(harnessed, { repo: 'example' });
+
+      expect(launched.status).toBe(201);
     });
   });
 
@@ -183,7 +424,7 @@ describe('repo registry', () => {
       const response = await harnessed.app.request('/repos');
 
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ repos: [] });
+      expect(await response.json()).toEqual({ repos: [], workspacesUnavailable: false });
     });
   });
 });

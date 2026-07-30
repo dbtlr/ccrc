@@ -2,12 +2,13 @@ import { hostname } from 'node:os';
 
 import { WORST_CASE_LAUNCH_MS } from './adapter/claude.ts';
 import type { ClaudeAdapter, HostSession, SessionActivity } from './adapter/claude.ts';
-import { findRepo } from './config.ts';
 import type { Config, RepoEntry } from './config.ts';
 import { BadRequestError, CcrcError, NotFoundError, messageOf } from './errors.ts';
 import { createLogger } from './log.ts';
 import type { Logger } from './log.ts';
 import type { SessionRecord, StateStore } from './state.ts';
+import { createRepoRegistry } from './workspaces.ts';
+import type { RepoRegistry } from './workspaces.ts';
 
 /**
  * A stored record plus the live detail reconciliation adds on read — everything a
@@ -35,6 +36,12 @@ export type RepoSummary = {
   readonly name: string;
 };
 
+/** The registry as a client sees it, including what ccrcd could not read. */
+export type RepoListing = {
+  readonly repos: readonly RepoSummary[];
+  readonly workspacesUnavailable: boolean;
+};
+
 /** What the hang watchdog did about one session, for logging and for tests. */
 export type HangOutcome = {
   readonly id: string;
@@ -48,7 +55,7 @@ export type HangOutcome = {
 };
 
 export type SessionService = {
-  readonly listRepos: () => readonly RepoSummary[];
+  readonly listRepos: () => Promise<RepoListing>;
   readonly launch: (input: LaunchInput) => Promise<SessionView>;
   readonly list: () => Promise<SessionListing>;
   readonly get: (id: string) => Promise<SessionView>;
@@ -65,6 +72,11 @@ export type SessionServiceOptions = {
   readonly adapter: ClaudeAdapter;
   readonly store: StateStore;
   readonly config: Config;
+  /**
+   * Where a repo name is resolved. Omitted, it is the config's `[[repos]]` alone —
+   * the same registry ccrcd had before anything was scanned.
+   */
+  readonly registry?: RepoRegistry;
   readonly host?: string;
   readonly now?: () => number;
   readonly generateId?: () => string;
@@ -307,6 +319,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   const now = options.now ?? Date.now;
   const generateId = options.generateId ?? randomId;
   const logger = options.logger ?? createLogger();
+  const registry = options.registry ?? createRepoRegistry({ config, logger });
 
   /**
    * A tmux that will not say which sessions are live makes liveness indeterminate,
@@ -564,7 +577,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     if (typeof input.repo !== 'string' || input.repo.length === 0) {
       throw new BadRequestError('"repo" is required and must be a registry repo name');
     }
-    const repo = findRepo(config, input.repo);
+    const repo = await registry.find(input.repo);
     if (repo === undefined) {
       throw new NotFoundError(`unknown repo "${input.repo}"`);
     }
@@ -573,7 +586,18 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return toView(started.record, started.hostSessions, started.records);
   };
 
-  const listRepos = (): readonly RepoSummary[] => config.repos.map((repo) => ({ name: repo.name }));
+  /**
+   * Scanned on every read rather than remembered: a workspace created a moment ago —
+   * by ccrcd, by `git clone`, or by hand — is launchable immediately, and nothing has
+   * to be kept in step with the filesystem.
+   */
+  const listRepos = async (): Promise<RepoListing> => {
+    const listing = await registry.list();
+    return {
+      repos: listing.repos.map((repo) => ({ name: repo.name })),
+      workspacesUnavailable: listing.workspacesUnavailable,
+    };
+  };
 
   const list = (): Promise<SessionListing> => reconcile();
 
@@ -758,6 +782,19 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     idleFor: number,
   ): Promise<HangOutcome | null> => {
     const symptom = `hung (busy ${minutesOf(idleFor)} min with a transcript that stopped moving)`;
+    /**
+     * Asked before anything is killed, because "the repo is gone" and "the host
+     * would not say" call for opposite behaviour: one retires the session, the other
+     * has to leave it entirely alone. Killing on an indeterminate answer is how a
+     * working session ends up stopped with nothing put in its place.
+     */
+    const repoPath = await registry.checkPath(record.repoPath);
+    if (repoPath === 'unknown') {
+      logger.error(
+        `ccrcd could not tell whether the repo of session ${record.id} is still there, so it was left running (${symptom})`,
+      );
+      return null;
+    }
     try {
       await adapter.stopSession(record.tmuxName);
     } catch (cause) {
@@ -776,13 +813,19 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       );
       return { id: record.id, reason, restartedAs: null };
     }
-    const repo = findRepo(config, record.repoName);
-    if (repo === undefined) {
-      const reason = `${symptom}; repo "${record.repoName}" is no longer in the registry, so it was not restarted`;
+    if (repoPath === 'missing') {
+      const reason = `${symptom}; the directory it was launched from is no longer there, so it was not restarted`;
       await retire(record.id, reason, null, session);
       logger.error(`ccrcd stopped session ${record.id}: ${reason}`);
       return { id: record.id, reason, restartedAs: null };
     }
+    /**
+     * The replacement continues the work that hung, so it goes back to the directory
+     * that work was in — the path stored on the record — rather than to whatever the
+     * name resolves to now. A directory of the same name appearing under the
+     * workspaces root would otherwise capture the restart.
+     */
+    const repo: RepoEntry = { name: record.repoName, path: record.repoPath };
     /**
      * The record is retired — and so claims the killed session's host entry — before
      * the replacement is started. The other order lets the replacement's own

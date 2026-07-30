@@ -5,6 +5,7 @@ import {
   BadRequestError,
   CcrcError,
   ForbiddenError,
+  NotFoundError,
   UnsupportedMediaTypeError,
   messageOf,
 } from '../errors.ts';
@@ -12,6 +13,7 @@ import type { HealthService } from '../health.ts';
 import { createLogger } from '../log.ts';
 import type { Logger } from '../log.ts';
 import type { LaunchInput, SessionService } from '../sessions.ts';
+import type { WorkspaceService } from '../workspaces.ts';
 import { createUiServer } from './ui.ts';
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
@@ -23,7 +25,7 @@ const READ_METHODS = new Set(['GET', 'HEAD']);
  * shell for anything else, and must never answer for one of them: a mistyped
  * `/sessions/` request has to stay a JSON error rather than become a page.
  */
-const API_PREFIXES = ['/healthz', '/repos', '/sessions'];
+const API_PREFIXES = ['/healthz', '/repos', '/sessions', '/workspaces'];
 
 /**
  * Compared case-insensitively and against the decoded path, because the fallback
@@ -63,6 +65,18 @@ const readLaunchInput = (body: unknown): LaunchInput => {
     throw new BadRequestError('"prompt" must be a string when present');
   }
   return { prompt, repo };
+};
+
+/** Shape only — what makes a name usable is the workspace service's business. */
+const readWorkspaceName = (body: unknown): string => {
+  if (!isRecord(body)) {
+    throw new BadRequestError('request body must be a JSON object');
+  }
+  const { name } = body;
+  if (typeof name !== 'string' || name.length === 0) {
+    throw new BadRequestError('"name" is required and must be a string');
+  }
+  return name;
 };
 
 const parseJsonBody = async (request: Request): Promise<unknown> => {
@@ -181,6 +195,8 @@ export type AppOptions = {
    * the process alone — which is all an app wired without one can honestly claim.
    */
   readonly health?: HealthService;
+  /** Workspace creation. Omitted, `POST /workspaces` answers as unconfigured. */
+  readonly workspaces?: WorkspaceService;
 };
 
 /** Wires the JSON API onto a session service. Nothing here knows about tmux. */
@@ -230,12 +246,30 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
   });
 
   // The console cannot read the TOML, so the registry it picks from comes from here.
-  app.get('/repos', (context) => context.json({ repos: service.listRepos() }));
+  app.get('/repos', async (context) => context.json(await service.listRepos()));
 
   app.post('/sessions', async (context) => {
     const input = readLaunchInput(await parseJsonBody(context.req.raw));
     const session = await service.launch(input);
     return context.json(session, 201);
+  });
+
+  /**
+   * Held to exactly the same gates as a launch: creating a workspace is how a
+   * directory becomes launchable, so it is as much a privileged mutation as the
+   * launch that follows it.
+   */
+  app.post('/workspaces', async (context) => {
+    const { workspaces } = options;
+    if (workspaces === undefined) {
+      throw new NotFoundError(
+        'ccrcd has no workspaces root configured, so it cannot create workspaces. Set "workspaces_root" in the config and restart the daemon.',
+      );
+    }
+    const created = await workspaces.create(
+      readWorkspaceName(await parseJsonBody(context.req.raw)),
+    );
+    return context.json(created, 201);
   });
 
   app.get('/sessions', async (context) => context.json(await service.list()));

@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 import { ConfigError } from './errors.ts';
 
@@ -34,6 +34,12 @@ export type Config = {
   /** Exact origins a browser may drive mutations from, beyond the daemon's own. */
   readonly allowedOrigins: readonly string[];
   readonly repos: readonly RepoEntry[];
+  /**
+   * Directory whose immediate subdirectories are launchable, and where new
+   * workspaces are created. `null` when the operator has not configured one, which
+   * turns both the scan and workspace creation off.
+   */
+  readonly workspacesRoot: string | null;
   readonly supervision: SupervisionConfig;
 };
 
@@ -93,6 +99,33 @@ const readRepos = (value: unknown, home: string): readonly RepoEntry[] => {
       path: expandHome(readString(entry, 'path', at), home),
     };
   });
+};
+
+/**
+ * Everything directly under this root becomes launchable, so it is held to the same
+ * shape as a repo path: `~` is expanded and the result has to be an absolute path.
+ * A relative root would resolve against whatever working directory the daemon
+ * happened to be started in — under launchd, not one the operator chose.
+ *
+ * The directory itself need not exist yet; the first workspace creation makes it.
+ */
+const readWorkspacesRoot = (value: unknown, home: string): string | null => {
+  if (value === undefined) {
+    return null;
+  }
+  if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) {
+    throw new ConfigError('config: "workspaces_root" must be a non-empty path string');
+  }
+  const expanded = expandHome(value, home);
+  if (!isAbsolute(expanded)) {
+    throw new ConfigError(
+      `config: "workspaces_root" must be an absolute path or start with "~", not "${value}"`,
+    );
+  }
+  // `resolve` on an already-absolute path normalises it and drops any trailing
+  // separator without consulting the working directory, which keeps every later
+  // join and containment check comparing like with like.
+  return resolve(expanded);
 };
 
 const readPort = (value: unknown): number => {
@@ -316,6 +349,7 @@ export const parseConfig = (source: string, configPath: string, home: string): C
     repos: readRepos(parsed.repos, home),
     stateDir: dirname(configPath),
     supervision: readSupervision(parsed.supervision),
+    workspacesRoot: readWorkspacesRoot(parsed.workspaces_root, home),
   };
 };
 

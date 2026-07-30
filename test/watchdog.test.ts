@@ -3,12 +3,14 @@ import { join } from 'node:path';
 
 import { WORST_CASE_LAUNCH_MS } from '../src/adapter/claude.ts';
 import type { HostSession } from '../src/adapter/claude.ts';
-import { loadConfig, stateFilePath } from '../src/config.ts';
+import { findRepo, loadConfig, stateFilePath } from '../src/config.ts';
+import type { Config } from '../src/config.ts';
 import { CommandTimeoutError, StopError } from '../src/errors.ts';
 import { LAUNCH_GRACE_MS, createSessionService } from '../src/sessions.ts';
 import type { HangOutcome, SessionService, SessionView } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
 import type { SessionRecord, StateStore } from '../src/state.ts';
+import type { PathState, RepoRegistry } from '../src/workspaces.ts';
 import {
   capturingLogger,
   fakeAdapter,
@@ -42,10 +44,24 @@ type Harness = {
   readonly at: (ms: number) => void;
 };
 
-const harness = async (dir: string, seeded: readonly SessionRecord[] = []): Promise<Harness> => {
+/** A registry that answers about paths however a test needs it to. */
+const pathRegistry = (state: PathState): RepoRegistry => ({
+  checkPath: () => Promise.resolve(state),
+  find: (name) => Promise.resolve(findRepo(harnessConfig, name)),
+  list: () => Promise.resolve({ repos: harnessConfig?.repos ?? [], workspacesUnavailable: false }),
+});
+
+let harnessConfig: Config;
+
+const harness = async (
+  dir: string,
+  seeded: readonly SessionRecord[] = [],
+  registry?: RepoRegistry,
+): Promise<Harness> => {
   const configPath = join(dir, 'config.toml');
   await Bun.write(configPath, CONFIG_TOML);
   const config = await loadConfig({ CCRC_CONFIG: configPath }, join(dir, 'home'));
+  harnessConfig = config;
   const adapter = fakeAdapter();
   const store = createStateStore(stateFilePath(config));
   await store.save(seeded);
@@ -62,6 +78,7 @@ const harness = async (dir: string, seeded: readonly SessionRecord[] = []): Prom
     host: 'test-host',
     logger: log.logger,
     now: () => current,
+    ...(registry === undefined ? {} : { registry }),
     store,
   });
   return {
@@ -587,11 +604,13 @@ describe('hang watchdog', () => {
     });
   });
 
-  test('stops a session whose repo left the registry rather than restarting it', async () => {
+  test('stops a session whose repo directory is gone rather than restarting it', async () => {
     await withTempDir(async (dir) => {
-      const harnessed = await harness(dir, [
-        hung({ id: 'id1', repoName: 'retired', repoPath: '/repos/retired' }),
-      ]);
+      const harnessed = await harness(
+        dir,
+        [hung({ id: 'id1', repoName: 'retired', repoPath: '/repos/retired' })],
+        pathRegistry('missing'),
+      );
       harnessed.adapter.liveNames = ['ccrc-example-1'];
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
@@ -599,9 +618,53 @@ describe('hang watchdog', () => {
       const outcomes = await harnessed.service.sweepHung();
 
       expect(outcomes[0]?.restartedAs).toBeNull();
-      expect(outcomes[0]?.reason).toMatch(/no longer in the registry/);
+      expect(outcomes[0]?.reason).toMatch(/no longer there/);
       expect((await harnessed.store.load())[0]?.status).toBe('stopped');
       expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('leaves a hung session alone when the host will not say if its repo is there', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [hung({ id: 'id1' })], pathRegistry('unknown'));
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [busySession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
+
+      expect(await harnessed.service.sweepHung()).toEqual([]);
+
+      // Killing on an answer the host would not give is how a working session gets
+      // retired with nothing to replace it. The next tick asks again.
+      expect(harnessed.adapter.stopped).toEqual([]);
+      expect(harnessed.adapter.launches).toEqual([]);
+      expect((await harnessed.store.load())[0]?.status).toBe('running');
+      expect(harnessed.log.errors.join('')).toMatch(/could not tell whether the repo/);
+    });
+  });
+
+  test('restarts into the path the record was launched from, not a name lookup', async () => {
+    await withTempDir(async (dir) => {
+      // The name now points somewhere else entirely — a directory of the same name
+      // made under the workspaces root after the session started.
+      const repointed: RepoRegistry = {
+        checkPath: () => Promise.resolve('present'),
+        find: () => Promise.resolve({ name: 'example', path: '/repos/impostor' }),
+        list: () =>
+          Promise.resolve({
+            repos: [{ name: 'example', path: '/repos/impostor' }],
+            workspacesUnavailable: false,
+          }),
+      };
+      const harnessed = await harness(dir, [hung({ id: 'id1' })], repointed);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [busySession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
+
+      const outcomes = await harnessed.service.sweepHung();
+
+      expect(outcomes[0]?.restartedAs).toBe('new1');
+      // The replacement continues the work that hung, in the same directory.
+      expect(harnessed.adapter.launches[0]?.repoPath).toBe('/repos/example');
     });
   });
 

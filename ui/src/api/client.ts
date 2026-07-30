@@ -23,9 +23,20 @@ export type Repo = {
   readonly name: string;
 };
 
+/** The launchable list, plus whether the daemon could read all of it. */
+export type Registry = {
+  readonly repos: Repo[];
+  readonly workspacesUnavailable: boolean;
+};
+
 export type LaunchRequest = {
   readonly repo: string;
   readonly prompt?: string | undefined;
+};
+
+/** What the daemon says it made. The path is shown nowhere; the name is the handle. */
+export type Workspace = {
+  readonly name: string;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -113,8 +124,13 @@ const JSON_HEADERS = { 'content-type': 'application/json' };
 export const fetchSessions = async (): Promise<Session[]> =>
   collect(await request('/sessions'), 'sessions', toSession);
 
-export const fetchRepos = async (): Promise<Repo[]> =>
-  collect(await request('/repos'), 'repos', toRepo);
+export const fetchRepos = async (): Promise<Registry> => {
+  const body = await request('/repos');
+  return {
+    repos: collect(body, 'repos', toRepo),
+    workspacesUnavailable: isRecord(body) && body.workspacesUnavailable === true,
+  };
+};
 
 export const launchSession = async (input: LaunchRequest): Promise<Session | null> =>
   toSession(
@@ -124,6 +140,19 @@ export const launchSession = async (input: LaunchRequest): Promise<Session | nul
       method: 'POST',
     }),
   );
+
+export const createWorkspace = async (name: string): Promise<Workspace> => {
+  const created = await request('/workspaces', {
+    body: JSON.stringify({ name }),
+    headers: JSON_HEADERS,
+    method: 'POST',
+  });
+  const reported = isRecord(created) ? asString(created.name) : '';
+  if (reported === '') {
+    throw new Error('ccrcd created the workspace but did not say what it is called');
+  }
+  return { name: reported };
+};
 
 export const stopSession = async (id: string): Promise<void> => {
   await request(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });

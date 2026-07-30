@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { createClaudeAdapter } from './adapter/claude.ts';
+import { createWorkspaceAdapter } from './adapter/workspaces.ts';
 import { loadConfig, stateFilePath } from './config.ts';
 import { messageOf } from './errors.ts';
 import { HEALTH_TIMEOUT_MS, createHealthService } from './health.ts';
@@ -9,18 +10,23 @@ import { createLogger } from './log.ts';
 import { createSessionService } from './sessions.ts';
 import { createStateStore } from './state.ts';
 import { startSupervisor } from './supervise.ts';
+import { createRepoRegistry, createWorkspaceService } from './workspaces.ts';
 
 const logger = createLogger();
 
 const start = async (): Promise<void> => {
   const config = await loadConfig();
   const statePath = stateFilePath(config);
+  const workspaceAdapter = createWorkspaceAdapter({ logger });
+  const registry = createRepoRegistry({ adapter: workspaceAdapter, config, logger });
   const service = createSessionService({
     adapter: createClaudeAdapter(),
     config,
     logger,
+    registry,
     store: createStateStore(statePath),
   });
+  const workspaces = createWorkspaceService({ adapter: workspaceAdapter, config, logger });
 
   // Health gets its own adapter with the short command timeout: the probe is raced
   // against the same deadline either way, but this is what kills the spawned
@@ -31,6 +37,11 @@ const start = async (): Promise<void> => {
     statePath,
   });
 
+  // Whatever an interrupted creation left behind goes before the listener is up: once
+  // requests are being accepted, a live creation's staging directory would be
+  // indistinguishable from a leftover. It cannot throw.
+  await workspaces.sweepStaging();
+
   const server = Bun.serve({
     fetch: createApp(service, {
       allowedOrigins: config.allowedOrigins,
@@ -38,6 +49,7 @@ const start = async (): Promise<void> => {
       logger,
       port: config.port,
       uiDir: Bun.env.CCRC_UI_DIR ?? defaultUiDir(),
+      workspaces,
     }).fetch,
     hostname: config.bind,
     port: config.port,
@@ -48,8 +60,9 @@ const start = async (): Promise<void> => {
   startSupervisor({ intervalMs: config.supervision.intervalMs, logger, service });
 
   const repoNames = config.repos.map((repo) => repo.name).join(', ') || 'none';
+  const root = config.workspacesRoot ?? 'not configured';
   logger.info(
-    `ccrcd listening on http://${server.hostname}:${server.port} (config ${config.configPath}; repos: ${repoNames}; supervising every ${Math.round(config.supervision.intervalMs / 1_000)}s)`,
+    `ccrcd listening on http://${server.hostname}:${server.port} (config ${config.configPath}; repos: ${repoNames}; workspaces: ${root}; supervising every ${Math.round(config.supervision.intervalMs / 1_000)}s)`,
   );
 };
 
