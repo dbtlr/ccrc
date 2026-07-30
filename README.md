@@ -124,6 +124,12 @@ Until that build exists the daemon still serves the whole API; the console's URL
 `503` with the command to run. Deep links work — any path the API does not own returns the
 app shell so client-side routing resolves it.
 
+Every response the console serves carries `x-content-type-options: nosniff`, and the shell
+also carries `content-security-policy: frame-ancestors 'none'`. Launching a session is one
+tap with the repo select defaulting to the first entry, and a same-origin `Origin` check
+cannot tell a legitimate tab from an iframe — `frame-ancestors 'none'` is what stops a page
+that embeds the console from turning that tap into a one-click launch.
+
 For UI development, run the daemon and Vite side by side; the dev server proxies the API
 routes to `127.0.0.1:7433`:
 

@@ -66,6 +66,30 @@ describe('serving the console', () => {
     });
   });
 
+  // Once a proxy makes the console browser-reachable, an unframed shell is the only
+  // thing standing between a stray iframe and a one-tap launch of a bypassPermissions
+  // session, since same-origin checks cannot tell a legitimate tab from a frame.
+  test('the shell refuses to be framed and is served with a sniff-proof content type', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const response = await app.request('/');
+
+      expect(response.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
+      expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    });
+  });
+
+  test('assets are served with a sniff-proof content type', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const script = await app.request('/assets/index-abc123.js');
+
+      expect(script.headers.get('x-content-type-options')).toBe('nosniff');
+    });
+  });
+
   test('the shell is never cached, so it cannot name assets that are gone', async () => {
     await withTempDir(async (dir) => {
       const { app } = await withBuiltUi(dir, 'present');
