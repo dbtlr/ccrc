@@ -16,6 +16,12 @@ export default toolingConfig({
     ignores: ['dist/**'],
     overrides: [
       {
+        // Tests assert over untyped HTTP JSON and persisted state; they own both
+        // ends of those assertions, so the safety bar there is the shipped code.
+        files: ['test/**'],
+        rules: { 'typescript/no-unsafe-type-assertion': 'off' },
+      },
+      {
         excludeFiles: ['src/adapter/**'],
         files: ['src/**'],
         rules: {
