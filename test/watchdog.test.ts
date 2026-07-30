@@ -962,7 +962,7 @@ describe('idle timeout', () => {
       const outcomes = await sweepIdle(harnessed);
 
       expect(outcomes).toEqual([
-        { id: 'id1', reason: 'idle for 35 minutes; stopped by the idle timeout' },
+        { id: 'id1', reason: 'no activity for 35 minutes; stopped by the idle timeout' },
       ]);
       expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
       const stored = (await harnessed.store.load())[0];
@@ -970,7 +970,7 @@ describe('idle timeout', () => {
       // the host entry, the end time — with the reason ccrcd had for doing it.
       expect(stored?.status).toBe('stopped');
       expect(stored?.endedAt).toBe(NOW);
-      expect(stored?.stopReason).toBe('idle for 35 minutes; stopped by the idle timeout');
+      expect(stored?.stopReason).toBe('no activity for 35 minutes; stopped by the idle timeout');
       expect(stored?.pid).toBe(4242);
       expect(stored?.hostSessionId).toBe('sid-1');
       // An idle stop is the end of it: nothing is restarted and no cap is touched.

@@ -956,7 +956,10 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     session: HostSession,
     idleFor: number,
   ): Promise<IdleOutcome | null> => {
-    const reason = `idle for ${minutesOf(idleFor)} minutes; stopped by the idle timeout`;
+    // What was measured is the transcript standing still, so that is what the record
+    // says: "idle for N minutes" would claim to know the session was doing nothing,
+    // and the two signals together only establish that nothing was written.
+    const reason = `no activity for ${minutesOf(idleFor)} minutes; stopped by the idle timeout`;
     try {
       await adapter.stopSession(record.tmuxName);
     } catch (cause) {
