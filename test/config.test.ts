@@ -188,6 +188,68 @@ const withConfig = async (
     await run(configPath);
   });
 
+describe('workspaces root', () => {
+  test('is absent unless the operator configures one', async () => {
+    await withConfig(SAMPLE, async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.workspacesRoot).toBeNull();
+    });
+  });
+
+  test('expands ~ against the home directory and normalises the result', async () => {
+    await withConfig('workspaces_root = "~/workspaces/"\n', async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.workspacesRoot).toBe('/home/tester/workspaces');
+    });
+  });
+
+  test('takes an absolute path as given', async () => {
+    await withConfig('workspaces_root = "/srv/workspaces"\n', async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.workspacesRoot).toBe('/srv/workspaces');
+    });
+  });
+
+  test.each(['workspaces_root = "code/workspaces"', 'workspaces_root = "./workspaces"'])(
+    'refuses the relative root in %s',
+    async (entry) => {
+      await withConfig(`${entry}\n`, async (configPath) => {
+        const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+        expect(failure).toBeInstanceOf(ConfigError);
+        expect(failure.message).toMatch(/"workspaces_root" must be an absolute path/);
+      });
+    },
+  );
+
+  test.each(['workspaces_root = ""', 'workspaces_root = 7', 'workspaces_root = ["/srv"]'])(
+    'refuses the unusable %s',
+    async (entry) => {
+      await withConfig(`${entry}\n`, async (configPath) => {
+        const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+        expect(failure).toBeInstanceOf(ConfigError);
+        expect(failure.message).toMatch(/"workspaces_root" must be a non-empty path string/);
+      });
+    },
+  );
+
+  test('does not have to exist when the config loads', async () => {
+    await withTempDir(async (dir) => {
+      const configPath = join(dir, 'config.toml');
+      const root = join(dir, 'not', 'there', 'yet');
+      await Bun.write(configPath, `workspaces_root = "${root}"\n`);
+
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.workspacesRoot).toBe(root);
+    });
+  });
+});
+
 describe('supervision config', () => {
   test('defaults the whole table when it is absent', async () => {
     await withConfig(SAMPLE, async (configPath) => {
