@@ -8,6 +8,8 @@ import {
   UnsupportedMediaTypeError,
   messageOf,
 } from '../errors.ts';
+import { createLogger } from '../log.ts';
+import type { Logger } from '../log.ts';
 import type { LaunchInput, SessionService } from '../sessions.ts';
 import { createUiServer } from './ui.ts';
 
@@ -172,6 +174,7 @@ export type AppOptions = {
   readonly port?: number;
   /** Where the built console lives. Omitted, the app is the JSON API alone. */
   readonly uiDir?: string | undefined;
+  readonly logger?: Logger;
 };
 
 /** Wires the JSON API onto a session service. Nothing here knows about tmux. */
@@ -181,6 +184,7 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
   const trustedOrigins = trustedOriginsFor(options.port ?? DEFAULT_PORT, allowedOrigins);
   const trustedHostnames = trustedHostnamesFor(allowedOrigins);
   const ui = options.uiDir === undefined ? undefined : createUiServer(options.uiDir);
+  const logger = options.logger ?? createLogger();
 
   // Response.json rather than context.json: the numeric status carried by the
   // failure needs no narrowing to Hono's status-code union. Only deliberate
@@ -190,7 +194,7 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
     if (failure instanceof CcrcError) {
       return Response.json({ error: failure.message }, { status: failure.status });
     }
-    process.stderr.write(`ccrcd request failed: ${failure.stack ?? messageOf(failure)}\n`);
+    logger.error(`ccrcd request failed: ${failure.stack ?? messageOf(failure)}`);
     return Response.json({ error: 'internal error' }, { status: 500 });
   });
 

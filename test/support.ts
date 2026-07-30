@@ -10,6 +10,8 @@ import type {
   LaunchRequest,
   StopOutcome,
 } from '../src/adapter/claude.ts';
+import { createLogger } from '../src/log.ts';
+import type { Logger } from '../src/log.ts';
 
 export const ok = (stdout = ''): CommandResult => ({ exitCode: 0, stderr: '', stdout });
 
@@ -48,6 +50,28 @@ export const fakeClock = (): { now: () => number; sleep: (ms: number) => Promise
       current += ms;
       return Promise.resolve();
     },
+  };
+};
+
+export type CapturedLog = {
+  readonly logger: Logger;
+  /** Lines written to stdout, formatted exactly as the daemon writes them. */
+  readonly info: string[];
+  readonly errors: string[];
+};
+
+/** A real logger with both sinks captured, so tests read lines instead of a stream. */
+export const capturingLogger = (now: () => number = () => 0): CapturedLog => {
+  const info: string[] = [];
+  const errors: string[] = [];
+  return {
+    errors,
+    info,
+    logger: createLogger({
+      err: (line) => void errors.push(line),
+      now,
+      out: (line) => void info.push(line),
+    }),
   };
 };
 

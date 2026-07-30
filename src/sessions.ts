@@ -4,6 +4,8 @@ import type { ClaudeAdapter, HostSession, SessionActivity } from './adapter/clau
 import { findRepo } from './config.ts';
 import type { Config, RepoEntry } from './config.ts';
 import { BadRequestError, CcrcError, NotFoundError, messageOf } from './errors.ts';
+import { createLogger } from './log.ts';
+import type { Logger } from './log.ts';
 import type { SessionRecord, StateStore } from './state.ts';
 
 /**
@@ -47,6 +49,7 @@ export type SessionServiceOptions = {
   readonly host?: string;
   readonly now?: () => number;
   readonly generateId?: () => string;
+  readonly logger?: Logger;
 };
 
 const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyz23456789';
@@ -179,6 +182,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   const host = options.host ?? hostname();
   const now = options.now ?? Date.now;
   const generateId = options.generateId ?? randomId;
+  const logger = options.logger ?? createLogger();
 
   /**
    * A tmux that will not say which sessions are live makes liveness indeterminate,
@@ -191,8 +195,8 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     try {
       return new Set(await adapter.liveSessionNames());
     } catch (cause) {
-      process.stderr.write(
-        `ccrcd could not read live tmux sessions, so records were left as they are: ${messageOf(cause)}\n`,
+      logger.error(
+        `ccrcd could not read live tmux sessions, so records were left as they are: ${messageOf(cause)}`,
       );
       return undefined;
     }
