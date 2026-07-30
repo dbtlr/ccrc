@@ -256,9 +256,9 @@ runs every `reconcile_interval_seconds`, plus once at startup, and does four thi
    busy session, one that reports no status, one that cannot be correlated, a transcript
    that cannot be read — is left alone, and a session is never stopped on the strength of
    one signal. What happens then is an ordinary stop: the tmux session is killed and the
-   record goes `stopped` with a reason like `idle for 75 minutes; stopped by the idle
-timeout`. Nothing is restarted — an idle stop is meant to be the end of it — and it has
-   no bearing on the restart cap.
+   record goes `stopped`, with a `stopReason` naming how long it sat there. Nothing is
+   restarted — an idle stop is meant to be the end of it — and it has no bearing on the
+   restart cap.
 4. **Prune.** `stopped` and `failed` records older than `stopped_retention_days` are dropped,
    measured from when the record ended rather than when it started.
 
