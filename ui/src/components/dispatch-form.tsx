@@ -79,13 +79,16 @@ export const DispatchForm = ({
       if (naming) {
         // The name is spent once the workspace exists — replaying it would only 409 —
         // but a creation that failed keeps it in the field for correction.
-        void onCreateAndLaunch({ name: name.trim(), ...message }).then(
-          () => {
+        const resetOnCreated = async (): Promise<void> => {
+          try {
+            await onCreateAndLaunch({ name: name.trim(), ...message });
             setName('');
             setCreating(false);
-          },
-          () => undefined,
-        );
+          } catch {
+            // The notice reports the failure; the input stays put.
+          }
+        };
+        void resetOnCreated();
       } else {
         onLaunch({ repo, ...message });
       }
