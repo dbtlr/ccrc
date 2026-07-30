@@ -89,13 +89,34 @@ const allocateNames = (
 };
 
 /**
+ * How far a host session's own start may sit from the record's before the two are
+ * taken to be different sessions. The record is written before `claude` starts and
+ * the attach URL has 60s to appear, so a session's own start legitimately trails
+ * its record's by that much; the window is twice that, to absorb a slow start and
+ * whatever skew there is in the time claude reports.
+ */
+const CORRELATION_WINDOW_MS = 120_000;
+
+const startedTogether = (session: HostSession, record: SessionRecord): boolean =>
+  session.startedAt !== null &&
+  Math.abs(session.startedAt - record.startedAt) <= CORRELATION_WINDOW_MS;
+
+/**
  * `claude agents --json` reports an auto-generated name that does not match the
  * remote-control name given at launch, so correlation goes through pid first and
- * falls back to cwd plus nearest start time.
+ * falls back to cwd.
+ *
+ * The fallback has to be conservative: a repo commonly has several sessions, and
+ * adopting the wrong one writes a stranger's pid into the record, which then drives
+ * its reported activity and every later pid correlation. So a candidate is only
+ * accepted when no other record already claims it, it started around the same time
+ * as the record, and it is the only one left — anything ambiguous correlates to
+ * nothing at all.
  */
 const correlate = (
   record: SessionRecord,
   hostSessions: readonly HostSession[],
+  records: readonly SessionRecord[],
 ): HostSession | undefined => {
   if (record.pid !== null) {
     const byPid = hostSessions.find((session) => session.pid === record.pid);
@@ -103,17 +124,18 @@ const correlate = (
       return byPid;
     }
   }
-  const byPath = hostSessions.filter((session) => session.cwd === record.repoPath);
-  if (byPath.length === 0) {
-    return undefined;
-  }
-  return byPath.reduce((closest, candidate) => {
-    const distance = (session: HostSession): number =>
-      session.startedAt === null
-        ? Number.POSITIVE_INFINITY
-        : Math.abs(session.startedAt - record.startedAt);
-    return distance(candidate) < distance(closest) ? candidate : closest;
-  });
+  const claimed = new Set(
+    records
+      .filter((other) => other.id !== record.id && other.pid !== null)
+      .map((other) => other.pid),
+  );
+  const candidates = hostSessions.filter(
+    (session) =>
+      session.cwd === record.repoPath &&
+      !claimed.has(session.pid) &&
+      startedTogether(session, record),
+  );
+  return candidates.length === 1 ? candidates[0] : undefined;
 };
 
 /** tmux session gone while the record still claims to be active → stopped. */
@@ -122,10 +144,14 @@ const stopIfGone = (record: SessionRecord, live: ReadonlySet<string>): SessionRe
     ? { ...record, status: 'stopped' }
     : record;
 
-const toView = (record: SessionRecord, hostSessions: readonly HostSession[]): SessionView => ({
+const toView = (
+  record: SessionRecord,
+  hostSessions: readonly HostSession[],
+  records: readonly SessionRecord[],
+): SessionView => ({
   ...record,
   activity: ACTIVE_STATUSES.has(record.status)
-    ? (correlate(record, hostSessions)?.status ?? 'unknown')
+    ? (correlate(record, hostSessions, records)?.status ?? 'unknown')
     : 'unknown',
 });
 
@@ -171,7 +197,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     });
     return {
       hostSessions,
-      sessions: sessions.map((record) => toView(record, hostSessions)),
+      sessions: sessions.map((record) => toView(record, hostSessions, sessions)),
     };
   };
 
@@ -222,11 +248,35 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       return { records: [...records, record], result: record };
     });
 
-    const settle = (record: SessionRecord): Promise<void> =>
-      store.update((records) => ({
-        records: records.map((entry) => (entry.id === record.id ? record : entry)),
-        result: undefined,
-      }));
+    /**
+     * The settled record is built inside the store's critical section, so the pid
+     * it correlates to is chosen against the records it lands beside, and the view
+     * it returns describes the same snapshot.
+     */
+    const settle = (
+      build: (records: readonly SessionRecord[]) => SessionRecord,
+    ): Promise<{ readonly record: SessionRecord; readonly records: readonly SessionRecord[] }> =>
+      store.update((records) => {
+        const record = build(records);
+        const next = records.map((entry) => (entry.id === record.id ? record : entry));
+        return { records: next, result: { record, records: next } };
+      });
+
+    /**
+     * A launch that failed after tmux came up leaves a bypassPermissions session
+     * running with nothing to revisit it: `failed` is not an active status, so
+     * reconciliation skips the record and `DELETE` cannot help either. The kill is
+     * best-effort — the adapter already kills the session on its own failure paths,
+     * so finding nothing is the normal case, and a teardown failure must not replace
+     * the launch failure that caused it.
+     */
+    const tearDown = async (tmuxName: string): Promise<void> => {
+      try {
+        await adapter.stopSession(tmuxName);
+      } catch {
+        // The launch failure is the one worth reporting, not this safety net's.
+      }
+    };
 
     try {
       const attachUrl = await adapter.launchSession({
@@ -236,16 +286,19 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         tmuxName: pending.tmuxName,
       });
       const hostSessions = await adapter.listHostSessions();
-      const launched: SessionRecord = {
+      const { record, records } = await settle((current) => ({
         ...pending,
         attachUrl,
-        pid: correlate(pending, hostSessions)?.pid ?? null,
+        pid: correlate(pending, hostSessions, current)?.pid ?? null,
         status: 'running',
-      };
-      await settle(launched);
-      return toView(launched, hostSessions);
+      }));
+      return toView(record, hostSessions, records);
     } catch (cause) {
-      await settle({ ...pending, status: 'failed' });
+      await tearDown(pending.tmuxName);
+      await settle((current) => ({
+        ...(current.find((entry) => entry.id === pending.id) ?? pending),
+        status: 'failed',
+      }));
       throw cause;
     }
   };
@@ -264,6 +317,11 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   /**
    * The record is only marked stopped once tmux confirms the session is gone; a
    * refused kill propagates so the record stays active and reconcilable.
+   *
+   * The kill itself is slow and must not hold the state mutex, so only the tmux name
+   * is read before it and the status is flipped on whatever the record looks like
+   * afterwards. Persisting the pre-kill snapshot instead would silently revert an
+   * attach URL or pid that a launch settling alongside the kill had just written.
    */
   const stop = async (id: string): Promise<SessionView> => {
     const stored = await store.load();
@@ -272,11 +330,17 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       throw new NotFoundError(`unknown session "${id}"`);
     }
     await adapter.stopSession(target.tmuxName);
-    const stopped: SessionRecord = { ...target, status: 'stopped' };
-    await store.update((records) => ({
-      records: records.map((record) => (record.id === id ? stopped : record)),
-      result: undefined,
-    }));
+    const stopped = await store.update((records) => {
+      const current = records.find((record) => record.id === id);
+      if (current === undefined) {
+        throw new NotFoundError(`unknown session "${id}"`);
+      }
+      const next: SessionRecord = { ...current, status: 'stopped' };
+      return {
+        records: records.map((record) => (record.id === id ? next : record)),
+        result: next,
+      };
+    });
     return { ...stopped, activity: 'unknown' };
   };
 

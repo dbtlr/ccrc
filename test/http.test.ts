@@ -178,6 +178,66 @@ describe('session lifecycle', () => {
     });
   });
 
+  test('adopts no pid when the repo already has an unrelated session', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      // Two claude sessions in the same repo: neither can be told apart by cwd, and
+      // the older one belongs to somebody else entirely.
+      harnessed.adapter.hostSessions = [
+        hostSession({
+          cwd: '/repos/example',
+          pid: 111,
+          startedAt: 1_764_000_000_000,
+          status: 'busy',
+        }),
+        hostSession({
+          cwd: '/repos/example',
+          pid: 222,
+          startedAt: 1_764_000_000_500,
+          status: 'idle',
+        }),
+      ];
+
+      const created = await postSession(harnessed, { repo: 'example' });
+
+      expect((await created.json()) as Record<string, unknown>).toMatchObject({
+        activity: 'unknown',
+        pid: null,
+        status: 'running',
+      });
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ pid: null });
+    });
+  });
+
+  test('adopts no pid from a session that started long before the record', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.hostSessions = [
+        hostSession({ cwd: '/repos/example', pid: 111, startedAt: 1_763_000_000_000 }),
+      ];
+
+      const created = await postSession(harnessed, { repo: 'example' });
+
+      expect((await created.json()) as Record<string, unknown>).toMatchObject({ pid: null });
+    });
+  });
+
+  test('leaves a session another record already claims alone', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.hostSessions = [
+        hostSession({ cwd: '/repos/example', pid: 4242, startedAt: 1_764_000_000_000 }),
+      ];
+
+      const first = await postSession(harnessed, { repo: 'example' });
+      const second = await postSession(harnessed, { repo: 'example' });
+
+      expect((await first.json()) as Record<string, unknown>).toMatchObject({ pid: 4242 });
+      expect((await second.json()) as Record<string, unknown>).toMatchObject({ pid: null });
+    });
+  });
+
   test('marks a session stopped once its tmux session is gone', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
@@ -225,6 +285,38 @@ describe('session lifecycle', () => {
       });
       const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
       expect(persisted[0]).toMatchObject({ attachUrl: null, status: 'failed' });
+    });
+  });
+
+  test('kills the tmux session a failed launch left behind', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      // tmux came up; the attach URL never did. The record goes to `failed`, which
+      // reconciliation never revisits, so the launch has to clean up after itself.
+      harnessed.adapter.attachUrl = new LaunchError('no attach URL appeared');
+
+      const response = await postSession(harnessed, { repo: 'example' });
+
+      expect(response.status).toBe(502);
+      expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
+      expect(harnessed.adapter.liveNames).toEqual([]);
+    });
+  });
+
+  test('a teardown that also fails does not mask the launch failure', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.attachUrl = new LaunchError('no attach URL appeared');
+      harnessed.adapter.stopOutcome = new StopError('tmux could not kill session ccrc-example-1');
+
+      const response = await postSession(harnessed, { repo: 'example' });
+
+      expect(response.status).toBe(502);
+      expect((await response.json()) as Record<string, unknown>).toEqual({
+        error: 'no attach URL appeared',
+      });
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ status: 'failed' });
     });
   });
 
@@ -299,6 +391,41 @@ describe('concurrency', () => {
       expect(persisted.map((record) => record.id)).toEqual(['id1', 'id2']);
       // The symptom of the lost record: the returned id 404s and the session orphans.
       expect((await harnessed.app.request('/sessions/id2', { method: 'DELETE' })).status).toBe(200);
+    });
+  });
+
+  test("a stop that overlaps a settling launch keeps the launch's attach URL and pid", async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      harnessed.adapter.hostSessions = [
+        hostSession({ cwd: '/repos/example', pid: 4242, startedAt: 1_764_000_000_000 }),
+      ];
+
+      // Hold the launch just before it settles, so DELETE reads the record while it
+      // is still `starting` with no attach URL and no pid.
+      const settling = Promise.withResolvers<void>();
+      harnessed.adapter.listDelay = () => settling.promise;
+      const launch = postSession(harnessed, { repo: 'example' });
+      await Bun.sleep(1);
+      harnessed.adapter.listDelay = () => Promise.resolve();
+
+      // Hold the kill too, then let the launch settle while the kill is in flight.
+      const killing = Promise.withResolvers<void>();
+      harnessed.adapter.stopDelay = () => killing.promise;
+      const deleted = harnessed.app.request('/sessions/id1', { method: 'DELETE' });
+      await Bun.sleep(1);
+      settling.resolve();
+      expect((await launch).status).toBe(201);
+      killing.resolve();
+
+      expect((await deleted).status).toBe(200);
+      // The kill's own pre-await snapshot would have reverted both of these to null.
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({
+        attachUrl: 'https://claude.ai/code/session_abc123',
+        pid: 4242,
+        status: 'stopped',
+      });
     });
   });
 
