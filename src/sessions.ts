@@ -771,6 +771,19 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     idleFor: number,
   ): Promise<HangOutcome | null> => {
     const symptom = `hung (busy ${minutesOf(idleFor)} min with a transcript that stopped moving)`;
+    /**
+     * Asked before anything is killed, because "the repo is gone" and "the host
+     * would not say" call for opposite behaviour: one retires the session, the other
+     * has to leave it entirely alone. Killing on an indeterminate answer is how a
+     * working session ends up stopped with nothing put in its place.
+     */
+    const repoPath = await registry.checkPath(record.repoPath);
+    if (repoPath === 'unknown') {
+      logger.error(
+        `ccrcd could not tell whether the repo of session ${record.id} is still there, so it was left running (${symptom})`,
+      );
+      return null;
+    }
     try {
       await adapter.stopSession(record.tmuxName);
     } catch (cause) {
@@ -789,13 +802,19 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       );
       return { id: record.id, reason, restartedAs: null };
     }
-    const repo = await registry.find(record.repoName);
-    if (repo === undefined) {
-      const reason = `${symptom}; repo "${record.repoName}" is no longer in the registry, so it was not restarted`;
+    if (repoPath === 'missing') {
+      const reason = `${symptom}; the directory it was launched from is no longer there, so it was not restarted`;
       await retire(record.id, reason, null, session);
       logger.error(`ccrcd stopped session ${record.id}: ${reason}`);
       return { id: record.id, reason, restartedAs: null };
     }
+    /**
+     * The replacement continues the work that hung, so it goes back to the directory
+     * that work was in — the path stored on the record — rather than to whatever the
+     * name resolves to now. A directory of the same name appearing under the
+     * workspaces root would otherwise capture the restart.
+     */
+    const repo: RepoEntry = { name: record.repoName, path: record.repoPath };
     /**
      * The record is retired — and so claims the killed session's host entry — before
      * the replacement is started. The other order lets the replacement's own

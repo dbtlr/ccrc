@@ -25,10 +25,19 @@ export type WorkspaceSummary = {
   readonly path: string;
 };
 
+/** Whether a repo path is still there. `unknown` when the host would not say. */
+export type PathState = 'present' | 'missing' | 'unknown';
+
 /** Where `launch` looks a repo name up. Config-only unless a root is configured. */
 export type RepoRegistry = {
   readonly list: () => Promise<readonly RepoEntry[]>;
   readonly find: (name: string) => Promise<RepoEntry | undefined>;
+  /**
+   * Whether a path a record was launched from is still usable. The watchdog asks
+   * before it kills anything, because "gone" and "cannot tell" call for opposite
+   * behaviour and only one of them is a reason to retire a session.
+   */
+  readonly checkPath: (path: string) => Promise<PathState>;
 };
 
 export type WorkspaceService = {
@@ -76,9 +85,15 @@ export const createRepoRegistry = (options: RegistryOptions): RepoRegistry => {
   const reported = new Set<string>();
 
   /**
-   * A root that cannot be read is a registry that is smaller than it should be, not
-   * a failed request: the config's own repos still launch, and reporting nothing at
-   * all would leave an operator wondering where their workspaces went.
+   * A root that cannot be read leaves the registry *unknown*, and unknown is not
+   * empty. Swallowing the failure would answer `/repos` with a list that quietly
+   * omits every workspace, and answer a launch into one of them with "no such repo" —
+   * both of which read as "your work is gone" when the truth is "this host would not
+   * say". The same lesson tmux liveness taught: indeterminate has to stay
+   * indeterminate.
+   *
+   * A root that simply does not exist yet is a different answer, and an honest one:
+   * there is nothing there.
    */
   const scan = async (): Promise<readonly string[]> => {
     if (adapter === undefined || root === null) {
@@ -87,10 +102,8 @@ export const createRepoRegistry = (options: RegistryOptions): RepoRegistry => {
     try {
       return await adapter.listDirectories(root);
     } catch (cause) {
-      logger.error(
-        `ccrcd could not scan the workspaces root, so only configured repos are launchable: ${messageOf(cause)}`,
-      );
-      return [];
+      logger.error(`ccrcd could not scan the workspaces root: ${messageOf(cause)}`);
+      throw cause;
     }
   };
 
@@ -113,7 +126,10 @@ export const createRepoRegistry = (options: RegistryOptions): RepoRegistry => {
     return [...config.repos, ...workspaces];
   };
 
-  /** The config wins on a name collision, so it is consulted first. */
+  /**
+   * The config wins on a name collision, so it is consulted first — which also means
+   * a configured repo still launches while the scan is failing.
+   */
   const find = async (name: string): Promise<RepoEntry | undefined> => {
     const configured = findRepo(config, name);
     if (configured !== undefined) {
@@ -126,7 +142,24 @@ export const createRepoRegistry = (options: RegistryOptions): RepoRegistry => {
     return scanned.includes(name) ? { name, path: join(root, name) } : undefined;
   };
 
-  return { find, list };
+  /**
+   * Without an adapter there is nothing to ask, so the answer is the behaviour ccrcd
+   * had before any of this existed: try the launch and let it fail if the path is
+   * bad. A configured registry has a filesystem to consult and gives a real answer.
+   */
+  const checkPath = async (path: string): Promise<PathState> => {
+    if (adapter === undefined) {
+      return 'present';
+    }
+    try {
+      return (await adapter.exists(path)) ? 'present' : 'missing';
+    } catch (cause) {
+      logger.error(`ccrcd could not check the repo path ${path}: ${messageOf(cause)}`);
+      return 'unknown';
+    }
+  };
+
+  return { checkPath, find, list };
 };
 
 export type WorkspaceServiceOptions = {

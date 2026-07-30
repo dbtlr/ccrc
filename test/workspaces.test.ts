@@ -161,20 +161,28 @@ describe('workspace scan', () => {
     });
   });
 
-  test('serves the configured repos when the root cannot be read', async () => {
+  test('reports a root it cannot read rather than answering with a short list', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
       // A file where the root should be: readdir answers ENOTDIR, not ENOENT.
       await writeFile(harnessed.root, 'not a directory\n');
-
       const registry = createRepoRegistry({
         adapter: harnessed.adapter,
         config: harnessed.config,
         logger: harnessed.log.logger,
       });
 
-      expect((await registry.list()).map((entry) => entry.name)).toEqual(['example']);
+      // An unreadable root makes the registry unknown, not smaller. Answering with
+      // the configured repos alone would read as "your workspaces are gone".
+      const listing = await rejection(registry.list());
+      expect(listing).toBeInstanceOf(WorkspaceError);
       expect(harnessed.log.errors.join('')).toMatch(/could not scan the workspaces root/);
+
+      // A configured repo still resolves: nothing about it depends on the scan.
+      expect((await registry.find('example'))?.path).toBe('/repos/example');
+      // Any other name is indeterminate, not absent.
+      const lookup = await rejection(registry.find('maybe'));
+      expect(lookup).toBeInstanceOf(WorkspaceError);
     });
   });
 });

@@ -360,6 +360,35 @@ describe('repo registry', () => {
     });
   });
 
+  test('answers 502 when the workspaces root cannot be read', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      // A file where the root should be: the scan cannot say what is launchable.
+      await Bun.write(root, 'not a directory\n');
+      const harnessed = await harness(dir, withWorkspaces(root));
+
+      const listed = await harnessed.app.request('/repos');
+      const launched = await postSession(harnessed, { repo: 'anything' });
+
+      // Not "here are the config repos", and not "no such repo" — neither is known.
+      expect(listed.status).toBe(502);
+      expect(launched.status).toBe(502);
+      expect(harnessed.adapter.launches).toEqual([]);
+    });
+  });
+
+  test('still launches a configured repo when the scan is broken', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      await Bun.write(root, 'not a directory\n');
+      const harnessed = await harness(dir, withWorkspaces(root));
+
+      const launched = await postSession(harnessed, { repo: 'example' });
+
+      expect(launched.status).toBe(201);
+    });
+  });
+
   test('does not publish where the repos live on the host', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
