@@ -15,7 +15,15 @@ export type SessionRecord = {
   readonly attachUrl: string | null;
   readonly pid: number | null;
   readonly startedAt: number;
+  /** When the record went terminal, or `null` while it is still active. */
+  readonly endedAt: number | null;
   readonly status: SessionStatus;
+  /** Why ccrcd retired the record, when it was not an operator's `DELETE`. */
+  readonly stopReason: string | null;
+  /** The hung record this one replaced. tmux names are never reused, so a restart
+   * is a new record rather than a revived one, and the pair is cross-linked. */
+  readonly restartedFrom: string | null;
+  readonly restartedAs: string | null;
 };
 
 /** The next records to persist plus whatever the caller wants back out. */
@@ -45,6 +53,12 @@ const asStatus = (value: unknown): SessionStatus =>
 const asString = (value: unknown, fallback = ''): string =>
   typeof value === 'string' ? value : fallback;
 
+const asNullableString = (value: unknown): string | null =>
+  typeof value === 'string' && value.length > 0 ? value : null;
+
+const asNullableNumber = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
 const toSessionRecord = (value: unknown): SessionRecord | null => {
   if (!isRecord(value)) {
     return null;
@@ -55,6 +69,7 @@ const toSessionRecord = (value: unknown): SessionRecord | null => {
   }
   return {
     attachUrl: typeof value.attachUrl === 'string' ? value.attachUrl : null,
+    endedAt: asNullableNumber(value.endedAt),
     host: asString(value.host),
     id,
     name: asString(value.name, id),
@@ -62,8 +77,11 @@ const toSessionRecord = (value: unknown): SessionRecord | null => {
     rcName: asString(value.rcName),
     repoName: asString(value.repoName),
     repoPath: asString(value.repoPath),
+    restartedAs: asNullableString(value.restartedAs),
+    restartedFrom: asNullableString(value.restartedFrom),
     startedAt: typeof value.startedAt === 'number' ? value.startedAt : 0,
     status: asStatus(value.status),
+    stopReason: asNullableString(value.stopReason),
     tmuxName: asString(value.tmuxName),
   };
 };

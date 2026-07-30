@@ -34,12 +34,26 @@ export type RepoSummary = {
   readonly name: string;
 };
 
+/** What the hang watchdog did about one session, for logging and for tests. */
+export type HangOutcome = {
+  readonly id: string;
+  readonly reason: string;
+  /** The replacement's id, or `null` when nothing was started in its place. */
+  readonly restartedAs: string | null;
+};
+
 export type SessionService = {
   readonly listRepos: () => readonly RepoSummary[];
   readonly launch: (input: LaunchInput) => Promise<SessionView>;
   readonly list: () => Promise<SessionListing>;
   readonly get: (id: string) => Promise<SessionView>;
   readonly stop: (id: string) => Promise<SessionView>;
+  /** Bring records back in line with tmux. Reads do this; so does the supervisor. */
+  readonly reconcile: () => Promise<SessionListing>;
+  /** Retire sessions that claim to be working but have stopped writing anything. */
+  readonly sweepHung: () => Promise<readonly HangOutcome[]>;
+  /** Drop terminal records past the retention window; returns how many went. */
+  readonly prune: () => Promise<number>;
 };
 
 export type SessionServiceOptions = {
@@ -66,6 +80,12 @@ export const slugify = (value: string): string =>
     .replaceAll(/^-+|-+$/g, '') || 'repo';
 
 const ACTIVE_STATUSES = new Set(['starting', 'running']);
+const TERMINAL_STATUSES = new Set(['stopped', 'failed']);
+
+const MINUTE_MS = 60_000;
+
+/** Durations in a reason an operator reads are minutes, not milliseconds. */
+const minutesOf = (ms: number): number => Math.round(ms / MINUTE_MS);
 
 /** Big enough for a pasted brief, small enough to stay well inside argv limits. */
 const MAX_PROMPT_LENGTH = 32_768;
@@ -155,10 +175,21 @@ const correlate = (
   return candidates.length === 1 ? candidates[0] : undefined;
 };
 
-/** tmux session gone while the record still claims to be active → stopped. */
-const stopIfGone = (record: SessionRecord, live: ReadonlySet<string>): SessionRecord =>
+/**
+ * tmux session gone while the record still claims to be active → stopped. This is
+ * also the whole of ccrcd's reboot story: a rebooted host has an empty tmux server,
+ * so the first reconciliation retires every record it left behind. Nothing is ever
+ * relaunched from that — a machine coming back up must not start running
+ * `bypassPermissions` sessions on its own.
+ */
+const stopIfGone = (record: SessionRecord, live: ReadonlySet<string>, at: number): SessionRecord =>
   ACTIVE_STATUSES.has(record.status) && !live.has(record.tmuxName)
-    ? { ...record, status: 'stopped' }
+    ? {
+        ...record,
+        endedAt: at,
+        status: 'stopped',
+        stopReason: record.stopReason ?? 'its tmux session was gone',
+      }
     : record;
 
 const withoutRepoPath = (record: SessionRecord): Omit<SessionRecord, 'repoPath'> => {
@@ -212,9 +243,10 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       liveNamesOrUnknown(),
       adapter.listHostSessions(),
     ]);
+    const at = now();
     const sessions = await store.update((records) => {
       const reconciled =
-        live === undefined ? records : records.map((record) => stopIfGone(record, live));
+        live === undefined ? records : records.map((record) => stopIfGone(record, live, at));
       const changed = reconciled.some((record, index) => record.status !== records[index]?.status);
       return { records: changed ? reconciled : records, result: changed ? reconciled : records };
     });
@@ -238,16 +270,22 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
   };
 
-  const launch = async (input: LaunchInput): Promise<SessionView> => {
-    if (typeof input.repo !== 'string' || input.repo.length === 0) {
-      throw new BadRequestError('"repo" is required and must be a registry repo name');
-    }
-    const repo = findRepo(config, input.repo);
-    if (repo === undefined) {
-      throw new NotFoundError(`unknown repo "${input.repo}"`);
-    }
-    const prompt = checkPrompt(input.prompt);
-
+  /**
+   * Starts a session and settles its record — the whole of a launch after the
+   * request has been validated. The watchdog's relaunch comes through here too, so
+   * a restarted session is allocated, named, and correlated exactly like an
+   * operator's launch; `restartedFrom` is the only difference.
+   */
+  const startSession = async (start: {
+    readonly repo: RepoEntry;
+    readonly prompt?: string | undefined;
+    readonly restartedFrom?: string | null;
+  }): Promise<{
+    readonly record: SessionRecord;
+    readonly records: readonly SessionRecord[];
+    readonly hostSessions: readonly HostSession[];
+  }> => {
+    const { prompt, repo } = start;
     const repoPath = await trustedPath(repo);
     const liveNames = await adapter.liveSessionNames();
     // Allocating the name and recording it are one serialized step: concurrent
@@ -257,6 +295,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       const id = generateId();
       const record: SessionRecord = {
         attachUrl: null,
+        endedAt: null,
         host,
         id,
         name: `${repo.name}-${index}`,
@@ -264,8 +303,11 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         rcName: `ccrc-${id}`,
         repoName: repo.name,
         repoPath,
+        restartedAs: null,
+        restartedFrom: start.restartedFrom ?? null,
         startedAt: now(),
         status: 'starting',
+        stopReason: null,
         tmuxName,
       };
       return { records: [...records, record], result: record };
@@ -315,15 +357,32 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         pid: correlate(pending, hostSessions, current)?.pid ?? null,
         status: 'running',
       }));
-      return toView(record, hostSessions, records);
+      return { hostSessions, record, records };
     } catch (cause) {
       await tearDown(pending.tmuxName);
       await settle((current) => ({
         ...(current.find((entry) => entry.id === pending.id) ?? pending),
+        endedAt: now(),
         status: 'failed',
+        // Only a deliberate failure describes itself: anything else may carry a
+        // command line or a host path, and the reason is served to clients.
+        stopReason: cause instanceof CcrcError ? cause.message : 'the launch failed',
       }));
       throw cause;
     }
+  };
+
+  const launch = async (input: LaunchInput): Promise<SessionView> => {
+    if (typeof input.repo !== 'string' || input.repo.length === 0) {
+      throw new BadRequestError('"repo" is required and must be a registry repo name');
+    }
+    const repo = findRepo(config, input.repo);
+    if (repo === undefined) {
+      throw new NotFoundError(`unknown repo "${input.repo}"`);
+    }
+    const prompt = checkPrompt(input.prompt);
+    const started = await startSession({ prompt, repo });
+    return toView(started.record, started.hostSessions, started.records);
   };
 
   const listRepos = (): readonly RepoSummary[] => config.repos.map((repo) => ({ name: repo.name }));
@@ -360,7 +419,14 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       if (current === undefined) {
         throw new NotFoundError(`unknown session "${id}"`);
       }
-      const next: SessionRecord = { ...current, status: 'stopped' };
+      // No reason: an operator's own `DELETE` needs no explanation, and a reason
+      // left over from an earlier ccrcd decision would be the wrong one.
+      const next: SessionRecord = {
+        ...current,
+        endedAt: now(),
+        status: 'stopped',
+        stopReason: null,
+      };
       return {
         records: records.map((record) => (record.id === id ? next : record)),
         result: next,
@@ -369,5 +435,183 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { ...withoutRepoPath(stopped), activity: 'unknown' };
   };
 
-  return { get, launch, list, listRepos, stop };
+  /** Retires a record ccrcd decided to end, with the reason it decided that. */
+  const retire = (id: string, reason: string, restartedAs: string | null): Promise<void> =>
+    store.update((records) => {
+      const current = records.find((record) => record.id === id);
+      if (current === undefined) {
+        return { records, result: undefined };
+      }
+      const next: SessionRecord = {
+        ...current,
+        endedAt: now(),
+        restartedAs,
+        status: 'stopped',
+        stopReason: reason,
+      };
+      return {
+        records: records.map((record) => (record.id === id ? next : record)),
+        result: undefined,
+      };
+    });
+
+  /**
+   * How stale a busy session's transcript is, or `null` when it is not hung.
+   *
+   * Two signals have to agree before a session is killed: the session says it is
+   * `busy`, and the transcript it would be appending to has not moved for the
+   * threshold. Everything else — an idle session, a session with no status of its
+   * own, one that could not be correlated, one with no session id, a transcript
+   * that cannot be read — is unknown, and unknown never trips the watchdog. Killing
+   * a working session because ccrcd could not see its transcript would destroy work
+   * nobody asked it to touch.
+   */
+  const staleFor = async (record: SessionRecord, session: HostSession): Promise<number | null> => {
+    if (session.status !== 'busy' || session.sessionId === null) {
+      return null;
+    }
+    const mtime = await adapter
+      .transcriptMtime({ cwd: session.cwd ?? record.repoPath, sessionId: session.sessionId })
+      .catch((cause: unknown) => {
+        logger.error(
+          `ccrcd could not read the transcript of session ${record.id}, so it was left running: ${messageOf(cause)}`,
+        );
+        return null;
+      });
+    if (mtime === null) {
+      return null;
+    }
+    const idleFor = now() - mtime;
+    return idleFor >= config.supervision.hangThresholdMs ? idleFor : null;
+  };
+
+  /**
+   * Automatic restarts already made in this record's restart lineage inside the
+   * window. The lineage is the `restartedFrom` chain, so a session restarted three
+   * times is one lineage rather than three unrelated sessions — which is what keeps
+   * a repo that wedges every session from being restarted forever.
+   */
+  const restartsInWindow = (record: SessionRecord, records: readonly SessionRecord[]): number => {
+    const byId = new Map(records.map((entry) => [entry.id, entry]));
+    const since = now() - config.supervision.restartCapWindowMs;
+    const seen = new Set<string>();
+    let count = 0;
+    let current: SessionRecord | undefined = record;
+    while (current !== undefined && !seen.has(current.id)) {
+      seen.add(current.id);
+      if (current.restartedFrom !== null && current.startedAt >= since) {
+        count += 1;
+      }
+      current = current.restartedFrom === null ? undefined : byId.get(current.restartedFrom);
+    }
+    return count;
+  };
+
+  /**
+   * Kills the hung session, then starts a fresh one in the same repo. The tmux name
+   * is never reused, so the replacement is a new record and the two are cross-linked
+   * both ways.
+   *
+   * A kill tmux refuses leaves the record active and untouched: a session that is
+   * still running must not be recorded as stopped, and the next tick will try again.
+   */
+  const restartHung = async (
+    record: SessionRecord,
+    idleFor: number,
+    records: readonly SessionRecord[],
+  ): Promise<HangOutcome | null> => {
+    const symptom = `hung (busy ${minutesOf(idleFor)} min with a transcript that stopped moving)`;
+    try {
+      await adapter.stopSession(record.tmuxName);
+    } catch (cause) {
+      logger.error(
+        `ccrcd found session ${record.id} ${symptom} but tmux refused to kill it, so the record was left active: ${messageOf(cause)}`,
+      );
+      return null;
+    }
+    const { restartCap, restartCapWindowMs } = config.supervision;
+    const already = restartsInWindow(record, records);
+    if (already >= restartCap) {
+      const reason = `${symptom}; the automatic restart cap of ${restartCap} per ${minutesOf(restartCapWindowMs)} min was reached, so it was not restarted`;
+      await retire(record.id, reason, null);
+      logger.error(
+        `ccrcd stopped session ${record.id} in repo ${record.repoName} and will not restart it: ${reason}. Sessions in that repo keep wedging — it needs an operator.`,
+      );
+      return { id: record.id, reason, restartedAs: null };
+    }
+    const repo = findRepo(config, record.repoName);
+    if (repo === undefined) {
+      const reason = `${symptom}; repo "${record.repoName}" is no longer in the registry, so it was not restarted`;
+      await retire(record.id, reason, null);
+      logger.error(`ccrcd stopped session ${record.id}: ${reason}`);
+      return { id: record.id, reason, restartedAs: null };
+    }
+    const replacement = await startSession({ repo, restartedFrom: record.id }).then(
+      (started) => started.record.id,
+      (cause: unknown) => {
+        logger.error(
+          `ccrcd stopped hung session ${record.id} but could not start its replacement: ${messageOf(cause)}`,
+        );
+        return null;
+      },
+    );
+    if (replacement === null) {
+      const reason = `${symptom}; the replacement session could not be started`;
+      await retire(record.id, reason, null);
+      return { id: record.id, reason, restartedAs: null };
+    }
+    const reason = `${symptom}; restarted as ${replacement}`;
+    await retire(record.id, reason, replacement);
+    logger.info(
+      `ccrcd restarted session ${record.id} in repo ${record.repoName} as ${replacement}: ${symptom}`,
+    );
+    return { id: record.id, reason, restartedAs: replacement };
+  };
+
+  const sweepHung = async (): Promise<readonly HangOutcome[]> => {
+    const records = await store.load();
+    const running = records.filter((record) => record.status === 'running');
+    if (running.length === 0) {
+      return [];
+    }
+    const hostSessions = await adapter.listHostSessions();
+    const checked = await Promise.all(
+      running.map(async (record) => {
+        const session = correlate(record, hostSessions, records);
+        if (session === undefined) {
+          return null;
+        }
+        const idleFor = await staleFor(record, session);
+        return idleFor === null ? null : { idleFor, record };
+      }),
+    );
+    // Restarts run together: each one allocates its tmux name inside the store's
+    // critical section, so two replacements can never claim the same name.
+    const outcomes = await Promise.all(
+      checked
+        .filter((entry) => entry !== null)
+        .map((entry) => restartHung(entry.record, entry.idleFor, records)),
+    );
+    return outcomes.filter((outcome) => outcome !== null);
+  };
+
+  /**
+   * Terminal records are history, and history is not kept forever: the state file is
+   * read and rewritten on nearly every request, so an unbounded one is a growing
+   * cost on every launch. Retention is measured from when the record ended, not from
+   * when it started, so a long session that stopped a minute ago is still recent.
+   */
+  const prune = (): Promise<number> =>
+    store.update((records) => {
+      const cutoff = now() - config.supervision.stoppedRetentionMs;
+      const kept = records.filter(
+        (record) =>
+          !TERMINAL_STATUSES.has(record.status) || (record.endedAt ?? record.startedAt) > cutoff,
+      );
+      return kept.length === records.length
+        ? { records, result: 0 }
+        : { records: kept, result: records.length - kept.length };
+    });
+
+  return { get, launch, list, listRepos, prune, reconcile, stop, sweepHung };
 };

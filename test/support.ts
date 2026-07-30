@@ -12,6 +12,7 @@ import type {
 } from '../src/adapter/claude.ts';
 import { createLogger } from '../src/log.ts';
 import type { Logger } from '../src/log.ts';
+import type { SessionRecord } from '../src/state.ts';
 
 export const ok = (stdout = ''): CommandResult => ({ exitCode: 0, stderr: '', stdout });
 
@@ -52,6 +53,26 @@ export const fakeClock = (): { now: () => number; sleep: (ms: number) => Promise
     },
   };
 };
+
+/** A stored session record, with only the fields a test cares about overridden. */
+export const sessionRecord = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({
+  attachUrl: 'https://claude.ai/code/session_01JQ4Z8YB0',
+  endedAt: null,
+  host: 'test-host',
+  id: 'id1',
+  name: 'example-1',
+  pid: null,
+  rcName: 'ccrc-id1',
+  repoName: 'example',
+  repoPath: '/repos/example',
+  restartedAs: null,
+  restartedFrom: null,
+  startedAt: 1_764_000_000_000,
+  status: 'running',
+  stopReason: null,
+  tmuxName: 'ccrc-example-1',
+  ...overrides,
+});
 
 export type CapturedLog = {
   readonly logger: Logger;
