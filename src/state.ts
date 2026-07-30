@@ -14,6 +14,12 @@ export type SessionRecord = {
   readonly rcName: string;
   readonly attachUrl: string | null;
   readonly pid: number | null;
+  /**
+   * The CLI's own id for the session this record was last correlated to. Kept for
+   * the same reason `pid` is: it is how a record claims a host entry, so a killed
+   * session's entry can never be adopted by the session that replaced it.
+   */
+  readonly hostSessionId: string | null;
   readonly startedAt: number;
   /** When the record went terminal, or `null` while it is still active. */
   readonly endedAt: number | null;
@@ -84,6 +90,7 @@ const toSessionRecord = (value: unknown): SessionRecord | null => {
     attachUrl: typeof value.attachUrl === 'string' ? value.attachUrl : null,
     endedAt: asNullableNumber(value.endedAt),
     host: asString(value.host),
+    hostSessionId: asNullableString(value.hostSessionId),
     id,
     name: asString(value.name, id),
     pid: typeof value.pid === 'number' ? value.pid : null,

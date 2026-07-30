@@ -59,6 +59,7 @@ export const sessionRecord = (overrides: Partial<SessionRecord> = {}): SessionRe
   attachUrl: 'https://claude.ai/code/session_01JQ4Z8YB0',
   endedAt: null,
   host: 'test-host',
+  hostSessionId: null,
   id: 'id1',
   name: 'example-1',
   pid: null,

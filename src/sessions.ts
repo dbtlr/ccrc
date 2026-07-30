@@ -161,15 +161,26 @@ const correlate = (
       return byPid;
     }
   }
-  const claimed = new Set(
-    records
-      .filter((other) => other.id !== record.id && other.pid !== null)
-      .map((other) => other.pid),
+  /**
+   * Identifiers another record has already claimed — including a retired one's. A
+   * killed session lingers in `claude agents --json` for a while, and its record
+   * keeps the pid and session id it was killed with precisely so the replacement
+   * cannot adopt them: inheriting a dead session's busy report and stopped-moving
+   * transcript is a hang as far as the watchdog can tell, so the healthy
+   * replacement would be killed next tick, and its replacement after that.
+   */
+  const others = records.filter((other) => other.id !== record.id);
+  const claimedPids = new Set<number>(
+    others.map((other) => other.pid).filter((pid): pid is number => pid !== null),
+  );
+  const claimedSessions = new Set<string>(
+    others.map((other) => other.hostSessionId).filter((id): id is string => id !== null),
   );
   const candidates = hostSessions.filter(
     (session) =>
       session.cwd === record.repoPath &&
-      !claimed.has(session.pid) &&
+      (session.pid === null || !claimedPids.has(session.pid)) &&
+      (session.sessionId === null || !claimedSessions.has(session.sessionId)) &&
       startedTogether(session, record),
   );
   return candidates.length === 1 ? candidates[0] : undefined;
@@ -298,6 +309,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         attachUrl: null,
         endedAt: null,
         host,
+        hostSessionId: null,
         id,
         name: `${repo.name}-${index}`,
         pid: null,
@@ -353,12 +365,18 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         tmuxName: pending.tmuxName,
       });
       const hostSessions = await adapter.listHostSessions();
-      const { record, records } = await settle((current) => ({
-        ...pending,
-        attachUrl,
-        pid: correlate(pending, hostSessions, current)?.pid ?? null,
-        status: 'running',
-      }));
+      const { record, records } = await settle((current) => {
+        const matched = correlate(pending, hostSessions, current);
+        return {
+          ...pending,
+          attachUrl,
+          // Both identifiers are kept: they are how this record claims its host
+          // entry against every other record's correlation.
+          hostSessionId: matched?.sessionId ?? null,
+          pid: matched?.pid ?? null,
+          status: 'running',
+        };
+      });
       return { hostSessions, record, records };
     } catch (cause) {
       await tearDown(pending.tmuxName);
@@ -437,8 +455,19 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { ...withoutRepoPath(stopped), activity: 'unknown' };
   };
 
-  /** Retires a record ccrcd decided to end, with the reason it decided that. */
-  const retire = (id: string, reason: string, restartedAs: string | null): Promise<void> =>
+  /**
+   * Retires a record ccrcd decided to end, with the reason it decided that.
+   *
+   * `killed` carries the host entry the session was killed with. Persisting it is
+   * what stops the replacement from adopting the dead session's entry: a retired
+   * record claims those identifiers for as long as it is kept.
+   */
+  const retire = (
+    id: string,
+    reason: string,
+    restartedAs: string | null,
+    killed?: HostSession,
+  ): Promise<void> =>
     store.update((records) => {
       const current = records.find((record) => record.id === id);
       if (current === undefined) {
@@ -447,6 +476,8 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       const next: SessionRecord = {
         ...current,
         endedAt: now(),
+        hostSessionId: killed?.sessionId ?? current.hostSessionId,
+        pid: killed?.pid ?? current.pid,
         restartedAs,
         status: 'stopped',
         stopReason: reason,
@@ -515,6 +546,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
    */
   const restartHung = async (
     record: SessionRecord,
+    session: HostSession,
     idleFor: number,
   ): Promise<HangOutcome | null> => {
     const symptom = `hung (busy ${minutesOf(idleFor)} min with a transcript that stopped moving)`;
@@ -530,7 +562,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     const already = recentRestarts(record);
     if (already.length >= restartCap) {
       const reason = `${symptom}; the automatic restart cap of ${restartCap} per ${minutesOf(restartCapWindowMs)} min was reached, so it was not restarted`;
-      await retire(record.id, reason, null);
+      await retire(record.id, reason, null, session);
       logger.error(
         `ccrcd stopped session ${record.id} in repo ${record.repoName} and will not restart it: ${reason}. Sessions in that repo keep wedging — it needs an operator.`,
       );
@@ -539,10 +571,17 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     const repo = findRepo(config, record.repoName);
     if (repo === undefined) {
       const reason = `${symptom}; repo "${record.repoName}" is no longer in the registry, so it was not restarted`;
-      await retire(record.id, reason, null);
+      await retire(record.id, reason, null, session);
       logger.error(`ccrcd stopped session ${record.id}: ${reason}`);
       return { id: record.id, reason, restartedAs: null };
     }
+    /**
+     * The record is retired — and so claims the killed session's host entry — before
+     * the replacement is started. The other order lets the replacement's own
+     * correlation adopt the dead entry it was launched to replace, and the watchdog
+     * then reads that entry's stale transcript as the replacement hanging.
+     */
+    await retire(record.id, `${symptom}; a replacement is being started`, null, session);
     let replacement: string | null = null;
     try {
       // The replacement inherits this record's restart history plus this restart, so
@@ -561,11 +600,11 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
     if (replacement === null) {
       const reason = `${symptom}; the replacement session could not be started`;
-      await retire(record.id, reason, null);
+      await retire(record.id, reason, null, session);
       return { id: record.id, reason, restartedAs: null };
     }
     const reason = `${symptom}; restarted as ${replacement}`;
-    await retire(record.id, reason, replacement);
+    await retire(record.id, reason, replacement, session);
     logger.info(
       `ccrcd restarted session ${record.id} in repo ${record.repoName} as ${replacement}: ${symptom}`,
     );
@@ -586,7 +625,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
           return null;
         }
         const idleFor = await staleFor(record, session);
-        return idleFor === null ? null : { idleFor, record };
+        return idleFor === null ? null : { idleFor, record, session };
       }),
     );
     // Restarts run together: each one allocates its tmux name inside the store's
@@ -594,7 +633,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     const outcomes = await Promise.all(
       checked
         .filter((entry) => entry !== null)
-        .map((entry) => restartHung(entry.record, entry.idleFor)),
+        .map((entry) => restartHung(entry.record, entry.session, entry.idleFor)),
     );
     return outcomes.filter((outcome) => outcome !== null);
   };

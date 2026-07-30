@@ -168,6 +168,30 @@ describe('hang watchdog', () => {
     });
   });
 
+  test('never lets a replacement adopt the host entry of the session it replaced', async () => {
+    await withTempDir(async (dir) => {
+      // pid null: this record was never correlated by pid, so nothing claims its
+      // host entry by pid the way a settled launch would.
+      const harnessed = await harness(dir, [hung({ id: 'id1', pid: null })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [busySession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
+
+      await harnessed.service.sweepHung();
+
+      // The killed session lingers in the CLI's fleet listing, still busy and still
+      // stale. Adopting it would make the watchdog kill the healthy replacement.
+      const second = await harnessed.service.sweepHung();
+
+      expect(second).toEqual([]);
+      expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
+      expect(harnessed.adapter.launches).toHaveLength(1);
+      const replacement = byId(await harnessed.store.load(), 'new1');
+      expect(replacement?.status).toBe('running');
+      expect(replacement?.pid).toBeNull();
+    });
+  });
+
   test('leaves the record active when tmux refuses the kill', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, [hung({ id: 'id1' })]);
