@@ -57,6 +57,25 @@ export class StopError extends CcrcError {
   }
 }
 
+/**
+ * tmux could not be asked which sessions are live. Liveness is indeterminate, not
+ * negative: nothing may be marked stopped on the strength of this.
+ */
+export class LivenessError extends CcrcError {
+  constructor(message: string) {
+    super(message, 502);
+    this.name = 'LivenessError';
+  }
+}
+
+/** A spawned command that outlived its timeout and was killed. */
+export class CommandTimeoutError extends CcrcError {
+  constructor(message: string) {
+    super(message, 504);
+    this.name = 'CommandTimeoutError';
+  }
+}
+
 /** Config file missing or unusable — fatal at startup, never served. */
 export class ConfigError extends CcrcError {
   constructor(message: string) {

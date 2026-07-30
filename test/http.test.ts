@@ -3,7 +3,7 @@ import { join } from 'node:path';
 
 import { loadConfig, stateFilePath } from '../src/config.ts';
 import type { Config } from '../src/config.ts';
-import { LaunchError, StopError } from '../src/errors.ts';
+import { LaunchError, LivenessError, StopError } from '../src/errors.ts';
 import { createApp } from '../src/http/app.ts';
 import { createSessionService } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
@@ -192,6 +192,23 @@ describe('session lifecycle', () => {
       expect(listing.sessions[0]).toMatchObject({ status: 'stopped' });
       const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
       expect(persisted[0]).toMatchObject({ status: 'stopped' });
+    });
+  });
+
+  test('leaves records alone when tmux will not say which sessions are live', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      await postSession(harnessed, { repo: 'example' });
+
+      // tmux is reachable enough to have launched the session but refuses to list.
+      harnessed.adapter.liveFailure = new LivenessError('tmux could not list its sessions');
+
+      const listed = await harnessed.app.request('/sessions');
+      expect(listed.status).toBe(200);
+      const listing = (await listed.json()) as { sessions: Record<string, unknown>[] };
+      expect(listing.sessions[0]).toMatchObject({ id: 'id1', status: 'running' });
+      const persisted = (await Bun.file(harnessed.statePath).json()) as Record<string, unknown>[];
+      expect(persisted[0]).toMatchObject({ status: 'running' });
     });
   });
 

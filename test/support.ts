@@ -81,8 +81,12 @@ export type FakeAdapter = ClaudeAdapter & {
   attachUrl: string | Error;
   stopOutcome: StopOutcome | Error;
   trustFailure: Error | null;
+  /** Set when tmux cannot be asked which sessions are live. */
+  liveFailure: Error | null;
   /** Awaited before every `listHostSessions`, to interleave requests on purpose. */
   listDelay: () => Promise<void>;
+  /** Awaited before every `stopSession`, to interleave requests on purpose. */
+  stopDelay: () => Promise<void>;
 };
 
 export const hostSession = (overrides: Partial<HostSession> = {}): HostSession => ({
@@ -105,13 +109,14 @@ export const fakeAdapter = (): FakeAdapter => {
   const adapter: FakeAdapter = {
     attachUrl: 'https://claude.ai/code/session_abc123',
     hostSessions: [],
+    // tmux comes up before the attach URL is polled for, so a launch that fails
+    // still leaves a session behind — the case the service has to clean up after.
     launchSession: (request) => {
       launches.push(request);
-      if (adapter.attachUrl instanceof Error) {
-        return Promise.reject(adapter.attachUrl);
-      }
       adapter.liveNames = [...adapter.liveNames, request.tmuxName];
-      return Promise.resolve(adapter.attachUrl);
+      return adapter.attachUrl instanceof Error
+        ? Promise.reject(adapter.attachUrl)
+        : Promise.resolve(adapter.attachUrl);
     },
     launches,
     listDelay: () => Promise.resolve(),
@@ -119,16 +124,22 @@ export const fakeAdapter = (): FakeAdapter => {
       await adapter.listDelay();
       return adapter.hostSessions;
     },
+    liveFailure: null,
     liveNames: [],
-    liveSessionNames: () => Promise.resolve(adapter.liveNames),
+    liveSessionNames: () =>
+      adapter.liveFailure === null
+        ? Promise.resolve(adapter.liveNames)
+        : Promise.reject(adapter.liveFailure),
+    stopDelay: () => Promise.resolve(),
     stopOutcome: 'stopped',
-    stopSession: (tmuxName) => {
+    stopSession: async (tmuxName) => {
+      await adapter.stopDelay();
       if (adapter.stopOutcome instanceof Error) {
-        return Promise.reject(adapter.stopOutcome);
+        throw adapter.stopOutcome;
       }
       stopped.push(tmuxName);
       adapter.liveNames = adapter.liveNames.filter((name) => name !== tmuxName);
-      return Promise.resolve(adapter.stopOutcome);
+      return adapter.stopOutcome;
     },
     stopped,
     trustFailure: null,

@@ -3,7 +3,7 @@ import { hostname } from 'node:os';
 import type { ClaudeAdapter, HostSession, SessionActivity } from './adapter/claude.ts';
 import { findRepo } from './config.ts';
 import type { Config, RepoEntry } from './config.ts';
-import { BadRequestError, CcrcError, NotFoundError } from './errors.ts';
+import { BadRequestError, CcrcError, NotFoundError, messageOf } from './errors.ts';
 import type { SessionRecord, StateStore } from './state.ts';
 
 /** A stored record plus the live detail reconciliation adds on read. */
@@ -136,18 +136,36 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   const generateId = options.generateId ?? randomId;
 
   /**
+   * A tmux that will not say which sessions are live makes liveness indeterminate,
+   * not negative — `undefined` rather than an empty set. Marking every active
+   * record stopped on that answer would retire records whose bypassPermissions
+   * sessions are still running, so the listing is served unreconciled instead and
+   * the reason is logged for the operator.
+   */
+  const liveNamesOrUnknown = async (): Promise<ReadonlySet<string> | undefined> => {
+    try {
+      return new Set(await adapter.liveSessionNames());
+    } catch (cause) {
+      process.stderr.write(
+        `ccrcd could not read live tmux sessions, so records were left as they are: ${messageOf(cause)}\n`,
+      );
+      return undefined;
+    }
+  };
+
+  /**
    * The slow adapter reads happen before the store is touched, so reconciliation
    * holds the state mutex only for the read-mutate-write itself and a launch
    * completing alongside a listing cannot be dropped.
    */
   const reconcile = async (): Promise<SessionListing> => {
-    const [liveNames, hostSessions] = await Promise.all([
-      adapter.liveSessionNames(),
+    const [live, hostSessions] = await Promise.all([
+      liveNamesOrUnknown(),
       adapter.listHostSessions(),
     ]);
-    const live = new Set(liveNames);
     const sessions = await store.update((records) => {
-      const reconciled = records.map((record) => stopIfGone(record, live));
+      const reconciled =
+        live === undefined ? records : records.map((record) => stopIfGone(record, live));
       const changed = reconciled.some((record, index) => record.status !== records[index]?.status);
       return { records: changed ? reconciled : records, result: changed ? reconciled : records };
     });

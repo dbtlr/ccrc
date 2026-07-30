@@ -11,8 +11,8 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { bunCommandRunner, createClaudeAdapter } from '../src/adapter/claude.ts';
-import { LaunchError, StopError } from '../src/errors.ts';
+import { createBunCommandRunner, createClaudeAdapter } from '../src/adapter/claude.ts';
+import { CommandTimeoutError, LaunchError, LivenessError, StopError } from '../src/errors.ts';
 import {
   failed,
   fakeClock,
@@ -264,7 +264,7 @@ describe('prompt quoting round-trip', () => {
       tmuxName: 'ccrc-example-1',
     });
     const commandLine = tmuxCalls(recording, 'new-session')[0]?.at(-1) ?? '';
-    const split = await bunCommandRunner([
+    const split = await createBunCommandRunner()([
       'sh',
       '-c',
       `set -- ${commandLine}; printf '%s\\0' "$@"`,
@@ -298,16 +298,37 @@ describe('prompt quoting round-trip', () => {
   });
 });
 
-describe('bunCommandRunner', () => {
+describe('command runner', () => {
   test('reports stdout, stderr, and the exit code of a real process', async () => {
-    const result = await bunCommandRunner(['sh', '-c', 'printf out; printf err >&2; exit 3']);
+    const result = await createBunCommandRunner()([
+      'sh',
+      '-c',
+      'printf out; printf err >&2; exit 3',
+    ]);
 
     expect(result).toEqual({ exitCode: 3, stderr: 'err', stdout: 'out' });
   });
 
   test('refuses an empty argv', async () => {
-    const failure = await rejection(bunCommandRunner([]));
+    const failure = await rejection(createBunCommandRunner()([]));
     expect(failure.message).toMatch(/empty argv/);
+  });
+
+  test('kills a command that outlives its timeout and says so', async () => {
+    const run = createBunCommandRunner(20);
+
+    const failure = await rejection(run(['sh', '-c', 'sleep 30']));
+
+    expect(failure).toBeInstanceOf(CommandTimeoutError);
+    expect(failure.message).toMatch(/sh did not finish within 20ms and was killed/);
+  });
+
+  test('a command that finishes inside its timeout is untouched', async () => {
+    expect(await createBunCommandRunner(30_000)(['sh', '-c', 'printf done'])).toEqual({
+      exitCode: 0,
+      stderr: '',
+      stdout: 'done',
+    });
   });
 });
 
@@ -617,5 +638,18 @@ describe('stop and liveness', () => {
 
     expect(await listed.liveSessionNames()).toEqual(['ccrc-example-1', 'ccrc-other-3']);
     expect(await noServer.liveSessionNames()).toEqual([]);
+  });
+
+  test('a tmux that will not answer is indeterminate, not an empty fleet', async () => {
+    const unreachable = createClaudeAdapter({
+      run: recordingRunner(() =>
+        failed('error connecting to /tmp/tmux-501/default (Permission denied)'),
+      ).run,
+    });
+
+    const failure = await rejection(unreachable.liveSessionNames());
+
+    expect(failure).toBeInstanceOf(LivenessError);
+    expect(failure.message).toMatch(/Permission denied/);
   });
 });

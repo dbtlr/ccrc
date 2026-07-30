@@ -2,7 +2,7 @@ import { readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { LaunchError, StopError } from '../errors.ts';
+import { CommandTimeoutError, LaunchError, LivenessError, StopError } from '../errors.ts';
 import { writeFileAtomic } from '../files.ts';
 import { createMutex } from '../mutex.ts';
 
@@ -55,12 +55,17 @@ export type ClaudeAdapter = {
   /** Every claude session on this host, ccrcd-launched or not. */
   readonly listHostSessions: () => Promise<readonly HostSession[]>;
   readonly stopSession: (tmuxName: string) => Promise<StopOutcome>;
-  /** Names of all live tmux sessions — one call instead of N liveness probes. */
+  /**
+   * Names of all live tmux sessions — one call instead of N liveness probes.
+   * Throws when tmux could not answer, so an unreadable server is never mistaken
+   * for an empty one.
+   */
   readonly liveSessionNames: () => Promise<readonly string[]>;
 };
 
 export type AdapterOptions = {
   readonly run?: CommandRunner;
+  readonly commandTimeoutMs?: number;
   readonly claudeConfigPath?: string;
   readonly resolvePath?: (path: string) => Promise<string>;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -76,25 +81,51 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000;
 /** The URL usually lands within a few hundred ms, so the first poll is quick. */
 const FIRST_POLL_INTERVAL_MS = 150;
 const DEFAULT_URL_TIMEOUT_MS = 60_000;
+/** Long enough for a slow tmux or claude start, short enough to fail a request. */
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const MISSING_SESSION_PATTERN = /can't find session|no such session|no server running/i;
 
 export const defaultClaudeConfigPath = (home: string = homedir()): string =>
   join(home, '.claude.json');
 
-/** Spawns real processes; the default `CommandRunner` outside tests. */
-export const bunCommandRunner: CommandRunner = async (argv) => {
-  const [command, ...args] = argv;
-  if (command === undefined) {
-    throw new Error('command runner received an empty argv');
-  }
-  const child = Bun.spawn([command, ...args], { stderr: 'pipe', stdout: 'pipe' });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  return { exitCode, stderr, stdout };
-};
+/**
+ * Spawns real processes; the default `CommandRunner` outside tests.
+ *
+ * Every command is bounded: a wedged tmux server or a `claude` CLI that never
+ * exits would otherwise hold the HTTP request that triggered it open forever,
+ * with no output to explain why. The child is killed on expiry and the timeout is
+ * reported as such — the command name only, never the argv, which carries the
+ * prompt.
+ */
+export const createBunCommandRunner =
+  (timeoutMs: number = DEFAULT_COMMAND_TIMEOUT_MS): CommandRunner =>
+  async (argv) => {
+    const [command, ...args] = argv;
+    if (command === undefined) {
+      throw new Error('command runner received an empty argv');
+    }
+    const child = Bun.spawn([command, ...args], { stderr: 'pipe', stdout: 'pipe' });
+    let expired = false;
+    const timer = setTimeout(() => {
+      expired = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+    try {
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      if (expired) {
+        throw new CommandTimeoutError(
+          `${command} did not finish within ${timeoutMs}ms and was killed`,
+        );
+      }
+      return { exitCode, stderr, stdout };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -232,7 +263,7 @@ const tailOf = (text: string, lines = 3): string =>
     .join(' / ');
 
 export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter => {
-  const run = options.run ?? bunCommandRunner;
+  const run = options.run ?? createBunCommandRunner(options.commandTimeoutMs);
   const claudeConfigPath = options.claudeConfigPath ?? defaultClaudeConfigPath();
   const resolvePath = options.resolvePath ?? ((path: string) => realpath(path));
   const now = options.now ?? Date.now;
@@ -260,9 +291,19 @@ export const createClaudeAdapter = (options: AdapterOptions = {}): ClaudeAdapter
     );
   };
 
+  /**
+   * "No server running" is a real answer — nothing is live. Any other failure is
+   * tmux declining to answer at all, and reporting that as an empty list would
+   * tell reconciliation every session is dead while they all keep running.
+   */
   const liveSessionNames = async (): Promise<readonly string[]> => {
     const result = await run(['tmux', 'list-sessions', '-F', '#{session_name}']);
     if (result.exitCode !== 0) {
+      if (!MISSING_SESSION_PATTERN.test(result.stderr)) {
+        throw new LivenessError(
+          `tmux could not list its sessions: ${result.stderr.trim() || `exit code ${result.exitCode}`}`,
+        );
+      }
       return [];
     }
     return result.stdout
