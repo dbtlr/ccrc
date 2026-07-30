@@ -168,7 +168,12 @@ runs every `reconcile_interval_seconds`, plus once at startup, and does three th
 1. **Reconcile.** Records whose tmux session is gone are marked `stopped`. That is also the
    whole of the reboot story: a rebooted host has an empty tmux server, so the startup tick
    retires everything left over. Nothing is ever relaunched on boot — a host coming back up
-   must not start `bypassPermissions` sessions on its own.
+   must not start `bypassPermissions` sessions on its own. Two things keep this honest: a
+   record is exempt from retirement for 90 seconds after it is created, because a liveness
+   snapshot taken during a launch legitimately does not list the session yet; and a
+   `starting` record past that window whose tmux session _is_ live is promoted to `running`,
+   which is what a daemon killed mid-launch leaves behind (its `attachUrl` stays `null` —
+   the URL is printed once into the pane and was never captured).
 2. **Watch for hangs.** A session is hung only when two signals agree: it reports itself
    `busy`, _and_ the transcript it would be writing to has not moved for
    `hang_threshold_minutes`. Anything indeterminate — an idle session, a session that
@@ -181,14 +186,18 @@ runs every `reconcile_interval_seconds`, plus once at startup, and does three th
 3. **Prune.** `stopped` and `failed` records older than `stopped_retention_days` are dropped,
    measured from when the record ended rather than when it started.
 
-At most `restart_cap` automatic restarts happen per restart lineage (the chain of
-`restartedFrom` links) within `restart_cap_window_minutes`. Past that the session is still
-killed but not replaced, the record says the cap was reached, and the daemon logs loudly:
-sessions in that repo keep wedging and want a human.
+At most `restart_cap` automatic restarts happen per restart lineage within
+`restart_cap_window_minutes`. The count comes from `restarts` — the timestamps of the
+restarts behind a record, handed to each replacement — rather than from walking
+`restartedFrom` links, so pruning, deleting, or hand-editing the dead records cannot reset
+it. Past the cap the session is still killed but not replaced, the record says the cap was
+reached, and the daemon logs loudly: sessions in that repo keep wedging and want a human.
 
 Ticks never overlap — a tick arriving while one is still running is dropped, not queued — and
 every phase is caught and logged on its own, so a tmux that cannot answer neither skips the
-prune nor stops the loop nor takes the daemon down.
+prune nor stops the loop nor takes the daemon down. Dropped ticks are logged; a run of more
+than three in a row is logged as an error, because that means a tick is wedged and nothing
+is being reconciled, watched, or pruned at all.
 
 ## Web console
 
@@ -266,6 +275,10 @@ A failed check answers `503` with that check marked `failed`. _Why_ it failed go
 log, not the response: a probe failure quotes host paths and command output, and `/healthz`
 is the one route with no origin check in front of it.
 
+Each run spawns processes, so concurrent callers share one run and the answer is reused for
+five seconds. That bounds the spawn rate however hard the route is hit — and means a
+dependency that has just recovered reads as unwell for up to that long.
+
 A session record looks like:
 
 ```json
@@ -278,12 +291,14 @@ A session record looks like:
   "rcName": "ccrc-k7m2p4qd",
   "attachUrl": "https://claude.ai/code/session_01JQ4Z8YB0",
   "pid": 4242,
+  "hostSessionId": "0c2f1d6e-...",
   "startedAt": 1764000000000,
   "endedAt": null,
   "status": "running",
   "stopReason": null,
   "restartedFrom": null,
   "restartedAs": null,
+  "restarts": [],
   "activity": "idle"
 }
 ```
@@ -291,7 +306,10 @@ A session record looks like:
 `endedAt` is when the record went terminal, and `stopReason` is why — set when ccrcd decided
 to end it (its tmux session was gone, a launch failed, the watchdog found it hung) and left
 `null` for an operator's own `DELETE`. `restartedFrom` and `restartedAs` cross-link a hung
-session to the one that replaced it.
+session to the one that replaced it, in both directions and even when the replacement's own
+launch failed. `pid` and `hostSessionId` are how a record claims its entry in the host
+fleet, which is what stops a replacement from adopting the killed session's entry;
+`restarts` is the automatic-restart history the cap is counted from.
 
 The repo's configured path stays on the host — same as `GET /repos` — so it is never part
 of a session record either.
