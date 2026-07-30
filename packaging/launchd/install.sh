@@ -70,7 +70,8 @@ mkdir -p "${agents_dir}" "${log_dir}"
 # destination so the final rename stays on one filesystem (launchd only scans for
 # *.plist, so the dotfile staging name is never picked up).
 staged="$(mktemp "${agents_dir}/.${label}.XXXXXX")"
-trap 'rm -f "${staged}"' EXIT
+previous=""
+trap 'rm -f "${staged}" ${previous:+"${previous}"}' EXIT
 
 CCRC_TEMPLATE="${template}" \
   CCRC_LABEL="${label}" \
@@ -86,12 +87,32 @@ if command -v plutil >/dev/null 2>&1; then
   plutil -lint "${staged}" >/dev/null
 fi
 
+# A reinstall replaces a working agent, and bootout/bootstrap can still refuse —
+# keep the old plist restorable so a failed bootstrap doesn't leave the host with
+# no agent at all.
+if [ -f "${plist}" ]; then
+  previous="$(mktemp "${agents_dir}/.${label}.previous.XXXXXX")"
+  cp "${plist}" "${previous}"
+fi
 mv "${staged}" "${plist}"
-trap - EXIT
 
 domain="gui/$(id -u)"
 launchctl bootout "${domain}/${label}" 2>/dev/null || true
-launchctl bootstrap "${domain}" "${plist}"
+if ! launchctl bootstrap "${domain}" "${plist}"; then
+  if [ -n "${previous}" ]; then
+    mv "${previous}" "${plist}"
+    launchctl bootstrap "${domain}" "${plist}" || true
+    echo "bootstrap of the new agent failed; restored the previous plist and agent" >&2
+  else
+    rm -f "${plist}"
+    echo "bootstrap of the new agent failed; removed its plist" >&2
+  fi
+  exit 1
+fi
+trap - EXIT
+if [ -n "${previous}" ]; then
+  rm -f "${previous}"
+fi
 
 echo "installed ${label}"
 echo "  plist:  ${plist}"
