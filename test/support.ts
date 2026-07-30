@@ -67,6 +67,7 @@ export const sessionRecord = (overrides: Partial<SessionRecord> = {}): SessionRe
   repoPath: '/repos/example',
   restartedAs: null,
   restartedFrom: null,
+  restarts: [],
   startedAt: 1_764_000_000_000,
   status: 'running',
   stopReason: null,

@@ -5,7 +5,7 @@ import type { HostSession } from '../src/adapter/claude.ts';
 import { loadConfig, stateFilePath } from '../src/config.ts';
 import { StopError } from '../src/errors.ts';
 import { createSessionService } from '../src/sessions.ts';
-import type { SessionService } from '../src/sessions.ts';
+import type { HangOutcome, SessionService } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
 import type { SessionRecord, StateStore } from '../src/state.ts';
 import {
@@ -287,12 +287,16 @@ describe('hang watchdog restraint', () => {
 });
 
 describe('restart cap', () => {
-  /** id1 → id2 → id3, with the two restarts landing `ago` before now. */
+  /**
+   * id1 → id2 → id3, where id3 is live and carries the history of the two restarts
+   * that produced it, both landing `ago` before now.
+   */
   const lineage = (ago: number): readonly SessionRecord[] => [
     sessionRecord({ id: 'id1', status: 'stopped', tmuxName: 'ccrc-example-1' }),
     sessionRecord({
       id: 'id2',
       restartedFrom: 'id1',
+      restarts: [NOW - ago - MINUTE],
       startedAt: NOW - ago - MINUTE,
       status: 'stopped',
       tmuxName: 'ccrc-example-2',
@@ -300,6 +304,7 @@ describe('restart cap', () => {
     hung({
       id: 'id3',
       restartedFrom: 'id2',
+      restarts: [NOW - ago - MINUTE, NOW - ago],
       startedAt: NOW - ago,
       tmuxName: 'ccrc-example-3',
     }),
@@ -312,6 +317,62 @@ describe('restart cap', () => {
     harnessed.adapter.transcripts = { 'sid-1': NOW - 20 * MINUTE };
     return harnessed;
   };
+
+  test('counts restarts from the live record, so pruned history cannot lift the cap', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [hung({ id: 'id1' })]);
+
+      /**
+       * One watchdog round with the retired record dropped afterwards, exactly as
+       * the retention prune would drop it. The cap has to survive that: it is the
+       * live record that carries the restart history, not a chain of dead records.
+       */
+      const round = async (index: number): Promise<readonly HangOutcome[]> => {
+        const live = (await harnessed.store.load()).filter((record) => record.status === 'running');
+        await harnessed.store.save(live);
+        harnessed.adapter.liveNames = live.map((record) => record.tmuxName);
+        harnessed.adapter.hostSessions = [
+          hostSession({
+            cwd: '/repos/example',
+            pid: 5_000 + index,
+            sessionId: `sid-${index}`,
+            startedAt: NOW,
+            status: 'busy',
+          }),
+        ];
+        harnessed.adapter.transcripts = { [`sid-${index}`]: NOW - 20 * MINUTE };
+        return harnessed.service.sweepHung();
+      };
+
+      await round(1);
+      await round(2);
+      const third = await round(3);
+
+      // Two restarts allowed, and the third refused — even with every ancestor gone.
+      expect(harnessed.adapter.launches).toHaveLength(2);
+      expect(third[0]?.restartedAs).toBeNull();
+      expect(third[0]?.reason).toMatch(/automatic restart cap of 2/);
+    });
+  });
+
+  test('hands the replacement the history it will be judged by, trimmed to the window', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [
+        // One restart three hours ago, one ten minutes ago: only the recent one counts.
+        hung({ id: 'id1', restarts: [NOW - 3 * 60 * MINUTE, NOW - 10 * MINUTE] }),
+      ]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [busySession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 20 * MINUTE };
+
+      await harnessed.service.sweepHung();
+
+      expect(byId(await harnessed.store.load(), 'new1')?.restarts).toEqual([
+        NOW - 10 * MINUTE,
+        NOW,
+      ]);
+    });
+  });
 
   test('refuses the restart that would exceed the cap for a lineage', async () => {
     await withTempDir(async (dir) => {

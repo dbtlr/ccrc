@@ -280,6 +280,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     readonly repo: RepoEntry;
     readonly prompt?: string | undefined;
     readonly restartedFrom?: string | null;
+    readonly restarts?: readonly number[];
   }): Promise<{
     readonly record: SessionRecord;
     readonly records: readonly SessionRecord[];
@@ -305,6 +306,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         repoPath,
         restartedAs: null,
         restartedFrom: start.restartedFrom ?? null,
+        restarts: start.restarts ?? [],
         startedAt: now(),
         status: 'starting',
         stopReason: null,
@@ -490,25 +492,17 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   };
 
   /**
-   * Automatic restarts already made in this record's restart lineage inside the
-   * window. The lineage is the `restartedFrom` chain, so a session restarted three
-   * times is one lineage rather than three unrelated sessions — which is what keeps
-   * a repo that wedges every session from being restarted forever.
+   * The automatic restarts behind this record that still fall inside the window.
+   *
+   * The history is carried by the record itself and handed to each replacement, so
+   * the count survives everything that happens to the dead records: retention
+   * pruning them, an operator deleting them, a state file rewritten by hand. Walking
+   * `restartedFrom` instead would reset the count the moment one link went missing —
+   * which is the state prune leaves behind by design.
    */
-  const restartsInWindow = (record: SessionRecord, records: readonly SessionRecord[]): number => {
-    const byId = new Map(records.map((entry) => [entry.id, entry]));
+  const recentRestarts = (record: SessionRecord): readonly number[] => {
     const since = now() - config.supervision.restartCapWindowMs;
-    const seen = new Set<string>();
-    let count = 0;
-    let current: SessionRecord | undefined = record;
-    while (current !== undefined && !seen.has(current.id)) {
-      seen.add(current.id);
-      if (current.restartedFrom !== null && current.startedAt >= since) {
-        count += 1;
-      }
-      current = current.restartedFrom === null ? undefined : byId.get(current.restartedFrom);
-    }
-    return count;
+    return record.restarts.filter((at) => at >= since);
   };
 
   /**
@@ -522,7 +516,6 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   const restartHung = async (
     record: SessionRecord,
     idleFor: number,
-    records: readonly SessionRecord[],
   ): Promise<HangOutcome | null> => {
     const symptom = `hung (busy ${minutesOf(idleFor)} min with a transcript that stopped moving)`;
     try {
@@ -534,8 +527,8 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       return null;
     }
     const { restartCap, restartCapWindowMs } = config.supervision;
-    const already = restartsInWindow(record, records);
-    if (already >= restartCap) {
+    const already = recentRestarts(record);
+    if (already.length >= restartCap) {
       const reason = `${symptom}; the automatic restart cap of ${restartCap} per ${minutesOf(restartCapWindowMs)} min was reached, so it was not restarted`;
       await retire(record.id, reason, null);
       logger.error(
@@ -552,7 +545,15 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     }
     let replacement: string | null = null;
     try {
-      replacement = (await startSession({ repo, restartedFrom: record.id })).record.id;
+      // The replacement inherits this record's restart history plus this restart, so
+      // the cap is enforced against the live record alone.
+      replacement = (
+        await startSession({
+          repo,
+          restartedFrom: record.id,
+          restarts: [...already, now()],
+        })
+      ).record.id;
     } catch (cause) {
       logger.error(
         `ccrcd stopped hung session ${record.id} but could not start its replacement: ${messageOf(cause)}`,
@@ -593,7 +594,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     const outcomes = await Promise.all(
       checked
         .filter((entry) => entry !== null)
-        .map((entry) => restartHung(entry.record, entry.idleFor, records)),
+        .map((entry) => restartHung(entry.record, entry.idleFor)),
     );
     return outcomes.filter((outcome) => outcome !== null);
   };
