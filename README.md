@@ -106,10 +106,19 @@ origin and content-type gates as a launch (`403`/`415`).
 What it creates is a directory, `git init`, and one empty commit
 (`chore: initialize workspace`) so a session has a history to work against from its first
 turn. The commit is made with an inline identity (`ccrcd <ccrcd@localhost>`) and signing off,
-because a daemon started at login has no git config of its own to fall back on. If `git`
-fails, the directory ccrcd just made is removed again rather than left behind as a
-half-initialised thing the next scan would offer to launch — unless something else has landed
-in it by then, in which case it stays and the log says so.
+because a daemon started at login has no git config of its own to fall back on.
+
+The work happens under a dotted staging name the scan skips, and the finished workspace is
+renamed onto the name you asked for as the last step. That is what keeps a half-made
+workspace out of the launchable set: the name appears only when there is a finished repo
+behind it, and a creation that fails leaves nothing under the root at all. Two creations
+racing for one name give one `201` and one `409` — the rename decides it. Anything git says
+goes to the log, not the response; the response names the step that failed.
+
+If the root cannot be read at all, the scan is _unknown_ rather than empty: `/repos` answers
+`502` instead of quietly listing only the configured repos, and launching an unlisted name
+answers `502` instead of "no such repo". Configured repos keep launching throughout — nothing
+about them depends on the scan.
 
 ### Supervision settings
 
@@ -230,7 +239,11 @@ runs every `reconcile_interval_seconds`, plus once at startup, and does three th
    `hang_threshold_minutes`. Anything indeterminate — an idle session, a session that
    reports no status, one that cannot be correlated to a record, one whose transcript cannot
    be read — never trips the watchdog. A hung session's tmux session is killed, its record
-   is marked `stopped` with the reason, and a fresh session is launched in the same repo.
+   is marked `stopped` with the reason, and a fresh session is launched in the same
+   _directory_ — the path the record was launched from, not whatever its name resolves to
+   now, so a same-named directory appearing under the workspaces root cannot capture the
+   restart. A repo directory that has since been deleted retires the session instead; a host
+   that will not say whether it is there leaves the session alone until the next tick.
    tmux names are never reused, so the replacement is a new record: it carries
    `restartedFrom`, the retired one carries `restartedAs`. The replacement starts with no
    prompt; the original first message is not stored and is not replayed.
