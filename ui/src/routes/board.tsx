@@ -2,8 +2,9 @@ import { useCallback, useState } from 'react';
 import type { JSX } from 'react';
 
 import type { LaunchRequest } from '../api/client.ts';
-import { useLaunch, useRepos, useSessions, useStop } from '../api/hooks.ts';
+import { useCreateWorkspace, useLaunch, useRepos, useSessions, useStop } from '../api/hooks.ts';
 import { DispatchForm } from '../components/dispatch-form.tsx';
+import type { CreateAndLaunchRequest } from '../components/dispatch-form.tsx';
 import { Notice } from '../components/notice.tsx';
 import { SessionRack } from '../components/session-rack.tsx';
 
@@ -17,6 +18,7 @@ export const Board = (): JSX.Element => {
   const repos = useRepos();
   const launch = useLaunch();
   const stop = useStop();
+  const create = useCreateWorkspace();
   const [dismissed, setDismissed] = useState('');
 
   // A mutation keeps its error until its own next `mutate()` or a `reset()` —
@@ -26,22 +28,46 @@ export const Board = (): JSX.Element => {
     (input: LaunchRequest) => {
       setDismissed('');
       stop.reset();
+      create.reset();
       launch.mutate(input);
     },
-    [launch, stop],
+    [create, launch, stop],
+  );
+
+  /**
+   * Two requests, one gesture: the launch is chained off the creation's own success
+   * so a workspace that could not be made never becomes a launch against a name that
+   * does not exist. A failed creation leaves its message in the notice below.
+   */
+  const startCreateAndLaunch = useCallback(
+    ({ name, prompt }: CreateAndLaunchRequest) => {
+      setDismissed('');
+      stop.reset();
+      launch.reset();
+      create.mutate(name, {
+        onSuccess: (created) =>
+          launch.mutate({ repo: created.name, ...(prompt === undefined ? {} : { prompt }) }),
+      });
+    },
+    [create, launch, stop],
   );
 
   const startStop = useCallback(
     (id: string) => {
       setDismissed('');
       launch.reset();
+      create.reset();
       stop.mutate(id);
     },
-    [launch, stop],
+    [create, launch, stop],
   );
 
   const failure =
-    launch.error?.message ?? stop.error?.message ?? repos.error?.message ?? sessions.error?.message;
+    create.error?.message ??
+    launch.error?.message ??
+    stop.error?.message ??
+    repos.error?.message ??
+    sessions.error?.message;
   const dismiss = useCallback(() => setDismissed(failure ?? ''), [failure]);
   const showing = failure === undefined || failure === dismissed ? undefined : failure;
 
@@ -50,7 +76,11 @@ export const Board = (): JSX.Element => {
       {showing === undefined ? null : (
         <Notice label="error" message={showing} onDismiss={dismiss} />
       )}
-      <DispatchForm launching={launch.isPending} onLaunch={startLaunch} />
+      <DispatchForm
+        launching={launch.isPending || create.isPending}
+        onCreateAndLaunch={startCreateAndLaunch}
+        onLaunch={startLaunch}
+      />
       <SessionRack onStop={startStop} stoppingId={stop.isPending ? stop.variables : undefined} />
     </div>
   );

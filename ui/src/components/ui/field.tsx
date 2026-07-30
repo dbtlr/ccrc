@@ -49,6 +49,10 @@ export const Select = ({ className, ...props }: ComponentProps<'select'>): JSX.E
   </div>
 );
 
+export const Input = ({ className, ...props }: ComponentProps<'input'>): JSX.Element => (
+  <input className={cn(CONTROL, 'min-h-14 font-mono text-body', className)} {...props} />
+);
+
 export const Textarea = ({ className, ...props }: ComponentProps<'textarea'>): JSX.Element => (
   <textarea
     className={cn(CONTROL, 'min-h-28 resize-y py-3 font-mono text-body leading-relaxed', className)}
