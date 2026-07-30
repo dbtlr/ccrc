@@ -64,6 +64,23 @@ path = "~/notes"
 Only repos in this registry can be launched; `POST /sessions` takes a registry `name`, never
 a path.
 
+### Supervision
+
+The daemon keeps its own house in order on a timer. Every key below is optional and shown
+with its default:
+
+```toml
+[supervision]
+reconcile_interval_seconds = 30   # how often the loop runs
+hang_threshold_minutes = 10       # busy + transcript this stale = hung
+restart_cap = 3                   # automatic restarts per lineage per window (0 = never)
+restart_cap_window_minutes = 60
+stopped_retention_days = 7        # how long stopped/failed records are kept
+```
+
+Durations must be positive numbers and `restart_cap` a whole number of 0 or more; anything
+else is a fatal startup error rather than a setting that silently misbehaves.
+
 ### Behind a reverse proxy
 
 The daemon stays loopback-bound, so reaching the console from a phone means fronting it with
@@ -103,6 +120,60 @@ bun run build          # builds the web console into ui/dist
 bun run start          # or: bun run dev  (reloads on change)
 CCRC_CONFIG=/path/to/config.toml bun run start
 ```
+
+Every log line is one line, prefixed with an ISO-8601 timestamp; ordinary events go to
+stdout and failures to stderr.
+
+## Run as a service
+
+On macOS, a per-user LaunchAgent starts the daemon at login and restarts it if it exits.
+The committed plist is a template — the installer fills in the host's paths (`bun` from
+`PATH`, the checkout the script lives in, `$HOME`, `$PATH`, and the config location) and
+loads the agent:
+
+```sh
+packaging/launchd/install.sh     # writes ~/Library/LaunchAgents/dev.ccrc.ccrcd.plist
+packaging/launchd/uninstall.sh   # unloads it and removes the plist
+```
+
+Logs land in `~/Library/Logs/ccrc/ccrcd.out.log` and `ccrcd.err.log`. The config has to
+exist first — a missing one is a fatal startup error, and `KeepAlive` would otherwise turn
+that into a restart loop — so the installer refuses to run without it. Set `CCRC_CONFIG`
+when installing to point the agent at a config elsewhere. It is a user agent, not a system
+daemon: sessions run as the operator, and nothing starts before login.
+
+Uninstalling only removes the agent. Sessions already running under tmux stay up; stop them
+through the API.
+
+## Supervision
+
+Reconciliation used to happen only when a client read the API. A loop inside the daemon now
+runs every `reconcile_interval_seconds`, plus once at startup, and does three things:
+
+1. **Reconcile.** Records whose tmux session is gone are marked `stopped`. That is also the
+   whole of the reboot story: a rebooted host has an empty tmux server, so the startup tick
+   retires everything left over. Nothing is ever relaunched on boot — a host coming back up
+   must not start `bypassPermissions` sessions on its own.
+2. **Watch for hangs.** A session is hung only when two signals agree: it reports itself
+   `busy`, _and_ the transcript it would be writing to has not moved for
+   `hang_threshold_minutes`. Anything indeterminate — an idle session, a session that
+   reports no status, one that cannot be correlated to a record, one whose transcript cannot
+   be read — never trips the watchdog. A hung session's tmux session is killed, its record
+   is marked `stopped` with the reason, and a fresh session is launched in the same repo.
+   tmux names are never reused, so the replacement is a new record: it carries
+   `restartedFrom`, the retired one carries `restartedAs`. The replacement starts with no
+   prompt; the original first message is not stored and is not replayed.
+3. **Prune.** `stopped` and `failed` records older than `stopped_retention_days` are dropped,
+   measured from when the record ended rather than when it started.
+
+At most `restart_cap` automatic restarts happen per restart lineage (the chain of
+`restartedFrom` links) within `restart_cap_window_minutes`. Past that the session is still
+killed but not replaced, the record says the cap was reached, and the daemon logs loudly:
+sessions in that repo keep wedging and want a human.
+
+Ticks never overlap — a tick arriving while one is still running is dropped, not queued — and
+every phase is caught and logged on its own, so a tmux that cannot answer neither skips the
+prune nor stops the loop nor takes the daemon down.
 
 ## Web console
 
@@ -148,7 +219,7 @@ loopback-reachable read-only file server over that directory instead.
 All responses are JSON. Errors are `{ "error": "..." }` with a 4xx/5xx status.
 
 ```sh
-# liveness
+# health: tmux reachable, claude CLI reachable, state file writable
 curl -s http://127.0.0.1:7433/healthz
 
 # the repo names a launch will accept (paths stay on the host)
@@ -169,6 +240,17 @@ curl -s http://127.0.0.1:7433/sessions/<id>
 curl -s -X DELETE http://127.0.0.1:7433/sessions/<id>
 ```
 
+`GET /healthz` probes the three things the daemon cannot work without, each bounded by a
+short two-second timeout so health answers while the trouble is happening:
+
+```json
+{ "ok": true, "checks": { "tmux": "ok", "claude": "ok", "state": "ok" } }
+```
+
+A failed check answers `503` with that check marked `failed`. _Why_ it failed goes to the
+log, not the response: a probe failure quotes host paths and command output, and `/healthz`
+is the one route with no origin check in front of it.
+
 A session record looks like:
 
 ```json
@@ -182,10 +264,19 @@ A session record looks like:
   "attachUrl": "https://claude.ai/code/session_01JQ4Z8YB0",
   "pid": 4242,
   "startedAt": 1764000000000,
+  "endedAt": null,
   "status": "running",
+  "stopReason": null,
+  "restartedFrom": null,
+  "restartedAs": null,
   "activity": "idle"
 }
 ```
+
+`endedAt` is when the record went terminal, and `stopReason` is why — set when ccrcd decided
+to end it (its tmux session was gone, a launch failed, the watchdog found it hung) and left
+`null` for an operator's own `DELETE`. `restartedFrom` and `restartedAs` cross-link a hung
+session to the one that replaced it.
 
 The repo's configured path stays on the host — same as `GET /repos` — so it is never part
 of a session record either.
@@ -207,6 +298,9 @@ contain NUL bytes.
 
 `status` is only advanced to `stopped` on a definite answer: if tmux cannot say which
 sessions are live, records are served as they stand rather than retired wholesale.
+
+Records are reconciled on every read and by the supervision loop, so a record can change
+between two reads without anyone calling `DELETE` — see [Supervision](#supervision).
 
 ## Development
 
