@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { createClaudeAdapter } from './adapter/claude.ts';
 import { loadConfig, stateFilePath } from './config.ts';
 import { messageOf } from './errors.ts';

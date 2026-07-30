@@ -20,10 +20,12 @@ Two facts decide where this daemon may listen:
 Together those make `POST /sessions` arbitrary code execution, so the bind is restricted to
 loopback: a `bind` outside `127.0.0.0/8`, `::1`, or `localhost` is a fatal startup error.
 Mutating requests (`POST`, `DELETE`) additionally have to look like they came from a local
-client rather than from a web page the operator happened to visit — `content-type:
-application/json` is required (`415` otherwise), and a cross-origin `Origin` or a cross-site
-`Sec-Fetch-Site` is refused (`403`). Reaching the API from elsewhere means putting an
-authenticated transport in front of it.
+client rather than from a web page the operator happened to visit: a cross-origin `Origin`
+or a cross-site `Sec-Fetch-Site` is refused (`403`). A mutation that carries a body (`POST`)
+must also declare `content-type: application/json` (`415` otherwise) — a content type no
+cross-origin form or simple `fetch` can set without a preflight this API never answers.
+`DELETE` is bodyless, so the origin checks are all it is held to. Reaching the API from
+elsewhere means putting an authenticated transport in front of it.
 
 ## Requirements
 
@@ -111,8 +113,14 @@ fleet — including sessions ccrcd did not launch.
 Launching pre-accepts the repo's trust dialog and then polls the new tmux pane for the
 attach URL. The URL has 60 seconds to appear; a launch that times out, a pane that exits
 first, and a kill tmux refuses on `DELETE` all answer `502` and leave the record honest (a
-timed-out launch kills its tmux session rather than orphaning it). A prompt is capped at
-32 KiB and may not contain NUL bytes.
+launch that fails after tmux came up kills its tmux session rather than orphaning a
+`bypassPermissions` session nothing will revisit). Each individual `tmux` or `claude`
+command gets 30 seconds before it is killed and the request answers `504`, so a wedged tmux
+server fails a request instead of hanging it. A prompt is capped at 32 KiB and may not
+contain NUL bytes.
+
+`status` is only advanced to `stopped` on a definite answer: if tmux cannot say which
+sessions are live, records are served as they stand rather than retired wholesale.
 
 ## Development
 
