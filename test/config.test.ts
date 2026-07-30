@@ -1,7 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 
-import { configPathFrom, findRepo, loadConfig, stateFilePath } from '../src/config.ts';
+import {
+  DEFAULT_SUPERVISION,
+  configPathFrom,
+  findRepo,
+  loadConfig,
+  stateFilePath,
+} from '../src/config.ts';
 import { ConfigError } from '../src/errors.ts';
 import { rejection, withTempDir } from './support.ts';
 
@@ -169,5 +175,108 @@ describe('loadConfig', () => {
 
   test('falls back to the XDG-style path when CCRC_CONFIG is unset', () => {
     expect(configPathFrom({}, '/home/tester')).toBe('/home/tester/.config/ccrc/config.toml');
+  });
+});
+
+const withConfig = async (
+  toml: string,
+  run: (configPath: string) => Promise<void>,
+): Promise<void> =>
+  withTempDir(async (dir) => {
+    const configPath = join(dir, 'config.toml');
+    await Bun.write(configPath, toml);
+    await run(configPath);
+  });
+
+describe('supervision config', () => {
+  test('defaults the whole table when it is absent', async () => {
+    await withConfig(SAMPLE, async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.supervision).toEqual(DEFAULT_SUPERVISION);
+      expect(config.supervision.intervalMs).toBe(30_000);
+      expect(config.supervision.hangThresholdMs).toBe(600_000);
+      expect(config.supervision.restartCap).toBe(3);
+      expect(config.supervision.restartCapWindowMs).toBe(3_600_000);
+      expect(config.supervision.stoppedRetentionMs).toBe(604_800_000);
+    });
+  });
+
+  test('reads the operator units and normalises them to milliseconds', async () => {
+    const toml = `[supervision]
+reconcile_interval_seconds = 5
+hang_threshold_minutes = 2
+restart_cap = 1
+restart_cap_window_minutes = 15
+stopped_retention_days = 0.5
+`;
+
+    await withConfig(toml, async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.supervision).toEqual({
+        hangThresholdMs: 120_000,
+        intervalMs: 5_000,
+        restartCap: 1,
+        restartCapWindowMs: 900_000,
+        stoppedRetentionMs: 43_200_000,
+      });
+    });
+  });
+
+  test('keeps the defaults for the keys a partial table leaves out', async () => {
+    await withConfig('[supervision]\nhang_threshold_minutes = 20\n', async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.supervision).toEqual({
+        ...DEFAULT_SUPERVISION,
+        hangThresholdMs: 1_200_000,
+      });
+    });
+  });
+
+  test('accepts a restart cap of zero as "never restart"', async () => {
+    await withConfig('[supervision]\nrestart_cap = 0\n', async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.supervision.restartCap).toBe(0);
+    });
+  });
+
+  test.each([
+    'reconcile_interval_seconds = 0',
+    'reconcile_interval_seconds = -1',
+    'hang_threshold_minutes = 0',
+    'restart_cap_window_minutes = -5',
+    'stopped_retention_days = 0',
+    'stopped_retention_days = "seven"',
+  ])('refuses the non-positive duration %s', async (entry) => {
+    await withConfig(`[supervision]\n${entry}\n`, async (configPath) => {
+      const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+      expect(failure).toBeInstanceOf(ConfigError);
+      expect(failure.message).toContain('[supervision]');
+      expect(failure.message).toMatch(/must be a positive number/);
+    });
+  });
+
+  test.each(['restart_cap = -1', 'restart_cap = 1.5', 'restart_cap = "many"'])(
+    'refuses the unusable %s',
+    async (entry) => {
+      await withConfig(`[supervision]\n${entry}\n`, async (configPath) => {
+        const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+        expect(failure).toBeInstanceOf(ConfigError);
+        expect(failure.message).toMatch(/"restart_cap" must be an integer of 0 or more/);
+      });
+    },
+  );
+
+  test('refuses a supervision value that is not a table', async () => {
+    await withConfig('supervision = 30\n', async (configPath) => {
+      const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+      expect(failure.message).toMatch(/"supervision" must be a \[supervision] table/);
+    });
   });
 });
