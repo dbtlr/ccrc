@@ -70,7 +70,7 @@ export const startSupervisor = (options: SuperviseOptions): Supervisor => {
       /**
        * The odd skip is ordinary — a tick that ran long. A run of them is not: it
        * means a tick is wedged on something that never returns, and nothing is being
-       * reconciled, watched, or pruned while that lasts. Dropped ticks are the only
+       * reconciled, swept, or pruned while that lasts. Dropped ticks are the only
        * symptom, so past a few in a row they stop being an aside.
        */
       const line =
@@ -78,9 +78,7 @@ export const startSupervisor = (options: SuperviseOptions): Supervisor => {
           ? 'ccrcd skipped a supervision tick because the previous one is still running'
           : `ccrcd skipped ${skipped} supervision ticks in a row because one is still running`;
       if (skipped > SKIPS_BEFORE_ALARM) {
-        logger.error(
-          `${line}; nothing is being reconciled, watched for hangs, or pruned until it returns`,
-        );
+        logger.error(`${line}; nothing is being reconciled, swept, or pruned until it returns`);
       } else {
         logger.info(line);
       }
@@ -91,6 +89,7 @@ export const startSupervisor = (options: SuperviseOptions): Supervisor => {
     try {
       await phase('reconcile records against tmux', () => service.reconcile());
       await phase('check for hung sessions', () => service.sweepHung());
+      await phase('stop idle sessions', () => service.sweepIdle());
       await phase('prune old records', async () => {
         const pruned = await service.prune();
         if (pruned > 0) {

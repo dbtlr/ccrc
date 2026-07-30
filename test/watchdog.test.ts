@@ -15,6 +15,7 @@ import {
   capturingLogger,
   fakeAdapter,
   hostSession,
+  rejection,
   sessionRecord,
   withTempDir,
 } from './support.ts';
@@ -53,13 +54,17 @@ const pathRegistry = (state: PathState): RepoRegistry => ({
 
 let harnessConfig: Config;
 
+/** The same table with the idle timeout switched on; the key belongs to it. */
+const IDLE_CONFIG_TOML = `${CONFIG_TOML}idle_timeout_minutes = 20\n`;
+
 const harness = async (
   dir: string,
   seeded: readonly SessionRecord[] = [],
   registry?: RepoRegistry,
+  configToml: string = CONFIG_TOML,
 ): Promise<Harness> => {
   const configPath = join(dir, 'config.toml');
-  await Bun.write(configPath, CONFIG_TOML);
+  await Bun.write(configPath, configToml);
   const config = await loadConfig({ CCRC_CONFIG: configPath }, join(dir, 'home'));
   harnessConfig = config;
   const adapter = fakeAdapter();
@@ -925,6 +930,180 @@ describe('retention prune', () => {
 
       expect(await harnessed.service.prune()).toBe(1);
       expect(await harnessed.store.load()).toEqual([]);
+    });
+  });
+});
+
+/** A running record with a correlated host session that reports itself idle. */
+const idleSession = (pid = 4242): HostSession =>
+  hostSession({ cwd: '/repos/example', pid, sessionId: 'sid-1', startedAt: NOW, status: 'idle' });
+
+const idleHarness = (dir: string, seeded: readonly SessionRecord[]): Promise<Harness> =>
+  harness(dir, seeded, undefined, IDLE_CONFIG_TOML);
+
+describe('idle timeout', () => {
+  test('stops a session that has been idle past the window', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [idleSession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 35 * MINUTE };
+
+      const outcomes = await harnessed.service.sweepIdle();
+
+      expect(outcomes).toEqual([
+        { id: 'id1', reason: 'idle for 35 minutes; stopped by the idle timeout' },
+      ]);
+      expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
+      const stored = (await harnessed.store.load())[0];
+      // Stopped exactly as an operator's DELETE stops one — the kill, the claim on
+      // the host entry, the end time — with the reason ccrcd had for doing it.
+      expect(stored?.status).toBe('stopped');
+      expect(stored?.endedAt).toBe(NOW);
+      expect(stored?.stopReason).toBe('idle for 35 minutes; stopped by the idle timeout');
+      expect(stored?.pid).toBe(4242);
+      expect(stored?.hostSessionId).toBe('sid-1');
+      // An idle stop is the end of it: nothing is restarted and no cap is touched.
+      expect(stored?.restartedAs).toBeNull();
+      expect(stored?.restarts).toEqual([]);
+      expect(harnessed.adapter.launches).toEqual([]);
+      expect(harnessed.log.info.join('')).toMatch(/stopped session id1 in repo example/);
+    });
+  });
+
+  test('records the end once, even when the sweep runs again later', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [idleSession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 35 * MINUTE };
+
+      await harnessed.service.sweepIdle();
+      harnessed.at(NOW + 10 * MINUTE);
+      expect(await harnessed.service.sweepIdle()).toEqual([]);
+
+      expect((await harnessed.store.load())[0]?.endedAt).toBe(NOW);
+    });
+  });
+
+  test('does nothing at all when the timeout is not configured', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [idleSession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 10 * DAY };
+      let fleetReads = 0;
+      harnessed.adapter.listDelay = () => {
+        fleetReads += 1;
+        return Promise.resolve();
+      };
+
+      expect(await harnessed.service.sweepIdle()).toEqual([]);
+
+      // Off means off: no fleet listing, no transcript reads, no work at all.
+      expect(fleetReads).toBe(0);
+      expect(harnessed.adapter.stopped).toEqual([]);
+      expect((await harnessed.store.load())[0]?.status).toBe('running');
+    });
+  });
+
+  test('leaves the record running when tmux refuses the kill', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [idleSession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 35 * MINUTE };
+      harnessed.adapter.stopOutcome = new StopError('operation not permitted');
+
+      expect(await harnessed.service.sweepIdle()).toEqual([]);
+
+      expect((await harnessed.store.load())[0]?.status).toBe('running');
+      expect(harnessed.log.errors.join('')).toMatch(/tmux refused to kill it/);
+    });
+  });
+
+  test('skips the sweep when the host fleet cannot be listed', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.listFailure = new CommandTimeoutError(
+        'claude did not finish within 30000ms and was killed',
+      );
+
+      // Not "nothing is idle", and certainly not "everything is": the tick gives up.
+      const failure = await rejection(harnessed.service.sweepIdle());
+
+      expect(failure).toBeInstanceOf(CommandTimeoutError);
+      expect(harnessed.adapter.stopped).toEqual([]);
+      expect((await harnessed.store.load())[0]?.status).toBe('running');
+    });
+  });
+});
+
+/** Everything the idle sweep has to read as unknown, and so never act on. */
+type IdleRestraintCase = {
+  readonly name: string;
+  readonly session: HostSession;
+  readonly transcripts?: Record<string, number>;
+  readonly record?: Partial<SessionRecord>;
+};
+
+describe('idle timeout restraint', () => {
+  const cases: IdleRestraintCase[] = [
+    {
+      name: 'a session that reports itself busy (the watchdog owns that)',
+      session: { ...idleSession(), status: 'busy' },
+    },
+    {
+      name: 'a session that reports no status at all',
+      session: { ...idleSession(), status: 'unknown' },
+    },
+    { name: 'an idle session with no session id', session: { ...idleSession(), sessionId: null } },
+    { name: 'a transcript that cannot be found', session: idleSession(), transcripts: {} },
+    {
+      name: 'a transcript that moved inside the window',
+      session: idleSession(),
+      transcripts: { 'sid-1': NOW - 19 * MINUTE },
+    },
+    {
+      name: 'a session that correlates to nothing',
+      record: { pid: 111 },
+      session: { ...idleSession(9_999), cwd: '/repos/elsewhere' },
+    },
+    {
+      name: 'a record that is not running yet',
+      record: { status: 'starting' },
+      session: idleSession(),
+    },
+  ];
+
+  test.each(cases)('never trips on $name', async ({ record, session, transcripts }) => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1', ...record })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [session];
+      harnessed.adapter.transcripts = transcripts ?? { 'sid-1': NOW - 60 * MINUTE };
+
+      expect(await harnessed.service.sweepIdle()).toEqual([]);
+
+      expect(harnessed.adapter.stopped).toEqual([]);
+      const stored = (await harnessed.store.load())[0];
+      expect(stored?.stopReason).toBeNull();
+      expect(stored?.endedAt).toBeNull();
+    });
+  });
+
+  test('never trips when the transcript cannot be probed at all', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [idleSession()];
+      harnessed.adapter.transcriptFailure = new Error('EIO');
+
+      expect(await harnessed.service.sweepIdle()).toEqual([]);
+
+      expect(harnessed.adapter.stopped).toEqual([]);
+      expect(harnessed.log.errors.join('')).toMatch(/could not read the transcript of session id1/);
     });
   });
 });
