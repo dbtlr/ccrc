@@ -160,6 +160,43 @@ describe('reboot reconciliation', () => {
     },
   );
 
+  test('claims the host entry of a session that died on its own', async () => {
+    await withTempDir(async (dir) => {
+      // A session that crashed, exited, or had its tmux session killed directly: no
+      // ccrcd code path ran, so reconciliation is the only place its entry gets claimed.
+      const harnessed = await harness(dir, [
+        hung({ id: 'id1', pid: null, startedAt: NOW - 3 * MINUTE }),
+      ]);
+      harnessed.adapter.liveNames = [];
+      harnessed.adapter.hostSessions = [
+        hostSession({
+          cwd: '/repos/example',
+          pid: 4242,
+          sessionId: 'sid-1',
+          // Recent enough to correlate with the dead record and with a relaunch.
+          startedAt: NOW - 100_000,
+          status: 'busy',
+        }),
+      ];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 20 * MINUTE };
+
+      await harnessed.service.reconcile();
+
+      const dead = byId(await harnessed.store.load(), 'id1');
+      expect(dead?.status).toBe('stopped');
+      expect(dead?.pid).toBe(4242);
+      expect(dead?.hostSessionId).toBe('sid-1');
+
+      // The operator starts another session in that repo; the dead entry is still
+      // listed, busy, with a transcript that stopped moving.
+      const replacement = await harnessed.service.launch({ repo: 'example' });
+
+      expect(replacement.pid).toBeNull();
+      expect(await harnessed.service.sweepHung()).toEqual([]);
+      expect(harnessed.adapter.stopped).toEqual([]);
+    });
+  });
+
   test('waits out the launch window before retiring a record tmux has never listed', async () => {
     await withTempDir(async (dir) => {
       // Written seconds ago: tmux may simply not have the session yet.

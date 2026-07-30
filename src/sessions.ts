@@ -247,27 +247,20 @@ const launchWindowPassed = (record: SessionRecord, live: LivenessSnapshot): bool
   record.startedAt + LAUNCH_GRACE_MS <= live.takenAt;
 
 /**
- * tmux session gone while the record still claims to be active → stopped. This is
- * also the whole of ccrcd's reboot story: a rebooted host has an empty tmux server,
- * so the first reconciliation retires every record it left behind. Nothing is ever
- * relaunched from that — a machine coming back up must not start running
+ * Whether an active record's tmux session is gone, as far as this snapshot can say.
+ * This is also the whole of ccrcd's reboot story: a rebooted host has an empty tmux
+ * server, so the first reconciliation retires every record it left behind. Nothing is
+ * ever relaunched from that — a machine coming back up must not start running
  * `bypassPermissions` sessions on its own.
  *
  * The snapshot is compared against the record's age, not against the clock: a
  * snapshot only speaks for the moment it was taken, and reconciliation's own host
  * listing can hold it for as long as the `claude` CLI takes to answer.
  */
-const stopIfGone = (record: SessionRecord, live: LivenessSnapshot, at: number): SessionRecord =>
+const isGone = (record: SessionRecord, live: LivenessSnapshot): boolean =>
   ACTIVE_STATUSES.has(record.status) &&
   !live.names.has(record.tmuxName) &&
-  launchWindowPassed(record, live)
-    ? {
-        ...record,
-        endedAt: at,
-        status: 'stopped',
-        stopReason: record.stopReason ?? 'its tmux session was gone',
-      }
-    : record;
+  launchWindowPassed(record, live);
 
 /**
  * A `starting` record with a live tmux session, long past any launch that could
@@ -341,12 +334,31 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       liveNamesOrUnknown(),
       adapter.listHostSessions(),
     ]);
-    const at = now();
+    /**
+     * A session that died on its own — crashed, exited, or had its tmux session killed
+     * outside ccrcd — is retired here and nowhere else, so this is the only chance to
+     * claim the host entry it leaves behind in the CLI's fleet listing. The listing is
+     * already in hand from the same read, so the claim costs nothing; without it the
+     * next session in that repo can adopt the dead entry, and the watchdog will kill it
+     * on a stranger's stale transcript.
+     */
+    const retireGone = (
+      record: SessionRecord,
+      records: readonly SessionRecord[],
+    ): SessionRecord => ({
+      ...record,
+      ...claimOf(record, correlate(record, hostSessions, records)),
+      status: 'stopped',
+      stopReason: record.stopReason ?? 'its tmux session was gone',
+    });
+
     const sessions = await store.update((records) => {
       const reconciled =
         live === undefined
           ? records
-          : records.map((record) => promoteIfStranded(stopIfGone(record, live, at), live));
+          : records.map((record) =>
+              isGone(record, live) ? retireGone(record, records) : promoteIfStranded(record, live),
+            );
       const changed = reconciled.some((record, index) => record.status !== records[index]?.status);
       return { records: changed ? reconciled : records, result: changed ? reconciled : records };
     });
