@@ -311,6 +311,51 @@ describe('workspace creation', () => {
     });
   });
 
+  test('answers one winner and conflicts for the rest when creates race', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      const service = createWorkspaceService({
+        adapter: harnessed.adapter,
+        config: harnessed.config,
+        logger: harnessed.log.logger,
+      });
+
+      const outcomes = await Promise.allSettled(
+        Array.from({ length: 4 }, () => service.create('contested')),
+      );
+
+      const created = outcomes.filter((outcome) => outcome.status === 'fulfilled');
+      const refused = outcomes.filter((outcome) => outcome.status === 'rejected');
+      expect(created).toHaveLength(1);
+      expect(refused).toHaveLength(3);
+      // Losing a race is the same answer as asking for a name that is already taken.
+      for (const outcome of refused) {
+        expect(outcome.reason).toBeInstanceOf(ConflictError);
+      }
+      expect(await readdir(harnessed.root)).toEqual(['contested']);
+    });
+  });
+
+  test('treats a dangling symlink at the name as taken', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      await mkdir(harnessed.root, { recursive: true });
+      // A link to nothing: following it says "no such file", but the name is in use
+      // and `mkdir` will refuse it every time.
+      await symlink(join(dir, 'gone'), join(harnessed.root, 'ghost'));
+      const service = createWorkspaceService({
+        adapter: harnessed.adapter,
+        config: harnessed.config,
+        logger: harnessed.log.logger,
+      });
+
+      const failure = await rejection(service.create('ghost'));
+
+      expect(failure).toBeInstanceOf(ConflictError);
+      expect(harnessed.gitCalls()).toEqual([]);
+    });
+  });
+
   test('refuses a name the config registry already has', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);

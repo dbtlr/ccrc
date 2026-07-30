@@ -1,6 +1,6 @@
-import { mkdir, readdir, realpath, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, readdir, realpath, rm } from 'node:fs/promises';
 
-import { WorkspaceError } from '../errors.ts';
+import { ConflictError, WorkspaceError } from '../errors.ts';
 import { createLogger } from '../log.ts';
 import type { Logger } from '../log.ts';
 import { createBunCommandRunner } from './claude.ts';
@@ -105,9 +105,14 @@ const prepareRoot = async (root: string): Promise<string> => {
   }
 };
 
+/**
+ * `lstat`, not `stat`: a symlink pointing at nothing follows to "no such file"
+ * while the name itself is thoroughly taken — `mkdir` would refuse it every time,
+ * and reporting it as free means answering a permanent conflict as a server error.
+ */
 const exists = async (path: string): Promise<boolean> => {
   try {
-    await stat(path);
+    await lstat(path);
     return true;
   } catch (cause) {
     if (errorCode(cause) === 'ENOENT') {
@@ -126,8 +131,10 @@ const createDirectory = async (path: string): Promise<string> => {
   try {
     await mkdir(path);
   } catch (cause) {
+    // Losing the race to another creation is the same answer as asking for a name
+    // that was already taken when the request arrived.
     if (errorCode(cause) === 'EEXIST') {
-      throw new WorkspaceError('that workspace already exists');
+      throw new ConflictError('that workspace already exists');
     }
     throw new WorkspaceError(
       `the workspace directory could not be created (${errorCode(cause) ?? 'unknown error'})`,
