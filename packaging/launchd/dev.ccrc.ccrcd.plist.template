@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent template for ccrcd. Every dunder-wrapped marker below is substituted
+  by install.sh from the host it runs on, so nothing host-specific is committed.
+
+  KeepAlive restarts the daemon whenever it exits, including a crash; RunAtLoad
+  starts it at login. A user agent, never a system daemon: sessions run as the
+  operator, with the operator's PATH, config, and login keychain.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BUN__</string>
+    <string>__REPO_DIR__/src/main.ts</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <!-- An agent inherits almost no environment, and ccrcd shells out to tmux and
+         the claude CLI: without a PATH that finds both, every launch fails. -->
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>CCRC_CONFIG</key>
+    <string>__CONFIG__</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/ccrcd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/ccrcd.err.log</string>
+</dict>
+</plist>
