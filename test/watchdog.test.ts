@@ -7,15 +7,15 @@ import { findRepo, loadConfig, stateFilePath } from '../src/config.ts';
 import type { Config } from '../src/config.ts';
 import { CommandTimeoutError, StopError } from '../src/errors.ts';
 import { LAUNCH_GRACE_MS, createSessionService } from '../src/sessions.ts';
-import type { HangOutcome, SessionService, SessionView } from '../src/sessions.ts';
+import type { HangOutcome, IdleOutcome, SessionService, SessionView } from '../src/sessions.ts';
 import { createStateStore } from '../src/state.ts';
 import type { SessionRecord, StateStore } from '../src/state.ts';
+import { startSupervisor } from '../src/supervise.ts';
 import type { PathState, RepoRegistry } from '../src/workspaces.ts';
 import {
   capturingLogger,
   fakeAdapter,
   hostSession,
-  rejection,
   sessionRecord,
   withTempDir,
 } from './support.ts';
@@ -214,7 +214,7 @@ describe('reboot reconciliation', () => {
       const replacement = await harnessed.service.launch({ repo: 'example' });
 
       expect(replacement.pid).toBeNull();
-      expect(await harnessed.service.sweepHung()).toEqual([]);
+      expect(await sweepHung(harnessed)).toEqual([]);
       expect(harnessed.adapter.stopped).toEqual([]);
     });
   });
@@ -453,7 +453,7 @@ describe('hang watchdog', () => {
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
 
-      const outcomes = await harnessed.service.sweepHung();
+      const outcomes = await sweepHung(harnessed);
 
       expect(outcomes).toEqual([
         {
@@ -499,7 +499,7 @@ describe('hang watchdog', () => {
         return Promise.resolve();
       };
 
-      await harnessed.service.sweepHung();
+      await sweepHung(harnessed);
 
       // Retention is measured from this, and the record's own reason is rewritten
       // twice on the way through — the kill is when the session ended.
@@ -514,7 +514,7 @@ describe('hang watchdog', () => {
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 30 * MINUTE };
 
-      await harnessed.service.sweepHung();
+      await sweepHung(harnessed);
 
       expect(harnessed.adapter.launches[0]?.prompt).toBeUndefined();
     });
@@ -529,11 +529,11 @@ describe('hang watchdog', () => {
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
 
-      await harnessed.service.sweepHung();
+      await sweepHung(harnessed);
 
       // The killed session lingers in the CLI's fleet listing, still busy and still
       // stale. Adopting it would make the watchdog kill the healthy replacement.
-      const second = await harnessed.service.sweepHung();
+      const second = await sweepHung(harnessed);
 
       expect(second).toEqual([]);
       expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
@@ -561,7 +561,7 @@ describe('hang watchdog', () => {
       expect(replacement.hostSessionId).toBeNull();
       // Adopting the dead entry would have the watchdog kill this healthy session,
       // and would leave it reporting a stranger's activity until then.
-      expect(await harnessed.service.sweepHung()).toEqual([]);
+      expect(await sweepHung(harnessed)).toEqual([]);
       expect(harnessed.adapter.stopped).toEqual(['ccrc-example-1']);
       expect(harnessed.adapter.launches).toHaveLength(1);
       const stored = await harnessed.store.load();
@@ -601,7 +601,7 @@ describe('hang watchdog', () => {
       harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
       harnessed.adapter.stopOutcome = new StopError('operation not permitted');
 
-      expect(await harnessed.service.sweepHung()).toEqual([]);
+      expect(await sweepHung(harnessed)).toEqual([]);
 
       expect((await harnessed.store.load())[0]?.status).toBe('running');
       expect(harnessed.adapter.launches).toEqual([]);
@@ -620,7 +620,7 @@ describe('hang watchdog', () => {
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
 
-      const outcomes = await harnessed.service.sweepHung();
+      const outcomes = await sweepHung(harnessed);
 
       expect(outcomes[0]?.restartedAs).toBeNull();
       expect(outcomes[0]?.reason).toMatch(/no longer there/);
@@ -636,7 +636,7 @@ describe('hang watchdog', () => {
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
 
-      expect(await harnessed.service.sweepHung()).toEqual([]);
+      expect(await sweepHung(harnessed)).toEqual([]);
 
       // Killing on an answer the host would not give is how a working session gets
       // retired with nothing to replace it. The next tick asks again.
@@ -665,7 +665,7 @@ describe('hang watchdog', () => {
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
 
-      const outcomes = await harnessed.service.sweepHung();
+      const outcomes = await sweepHung(harnessed);
 
       expect(outcomes[0]?.restartedAs).toBe('new1');
       // The replacement continues the work that hung, in the same directory.
@@ -681,7 +681,7 @@ describe('hang watchdog', () => {
       harnessed.adapter.transcripts = { 'sid-1': NOW - 15 * MINUTE };
       harnessed.adapter.attachUrl = new Error('no attach URL appeared');
 
-      const outcomes = await harnessed.service.sweepHung();
+      const outcomes = await sweepHung(harnessed);
 
       // The replacement exists as a failed record, so the pair still cross-links
       // both ways: a record pointing at nothing hides where the session went.
@@ -738,7 +738,7 @@ describe('hang watchdog restraint', () => {
       harnessed.adapter.hostSessions = [session];
       harnessed.adapter.transcripts = transcripts ?? { 'sid-1': NOW - 60 * MINUTE };
 
-      expect(await harnessed.service.sweepHung()).toEqual([]);
+      expect(await sweepHung(harnessed)).toEqual([]);
 
       expect(harnessed.adapter.stopped).toEqual([]);
       expect(harnessed.adapter.launches).toEqual([]);
@@ -753,7 +753,7 @@ describe('hang watchdog restraint', () => {
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcriptFailure = new Error('EIO');
 
-      expect(await harnessed.service.sweepHung()).toEqual([]);
+      expect(await sweepHung(harnessed)).toEqual([]);
 
       expect(harnessed.adapter.stopped).toEqual([]);
       expect(harnessed.log.errors.join('')).toMatch(/could not read the transcript of session id1/);
@@ -816,7 +816,7 @@ describe('restart cap', () => {
           }),
         ];
         harnessed.adapter.transcripts = { [`sid-${index}`]: NOW - 20 * MINUTE };
-        return harnessed.service.sweepHung();
+        return sweepHung(harnessed);
       };
 
       await round(1);
@@ -840,7 +840,7 @@ describe('restart cap', () => {
       harnessed.adapter.hostSessions = [busySession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 20 * MINUTE };
 
-      await harnessed.service.sweepHung();
+      await sweepHung(harnessed);
 
       expect(byId(await harnessed.store.load(), 'new1')?.restarts).toEqual([
         NOW - 10 * MINUTE,
@@ -853,7 +853,7 @@ describe('restart cap', () => {
     await withTempDir(async (dir) => {
       const harnessed = await sweepLineage(dir, 5 * MINUTE);
 
-      const outcomes = await harnessed.service.sweepHung();
+      const outcomes = await sweepHung(harnessed);
 
       expect(outcomes[0]?.restartedAs).toBeNull();
       expect(outcomes[0]?.reason).toMatch(/automatic restart cap of 2 per 60 min was reached/);
@@ -871,7 +871,7 @@ describe('restart cap', () => {
     await withTempDir(async (dir) => {
       const harnessed = await sweepLineage(dir, 3 * 60 * MINUTE);
 
-      const outcomes = await harnessed.service.sweepHung();
+      const outcomes = await sweepHung(harnessed);
 
       expect(outcomes[0]?.restartedAs).toBe('new1');
       expect(harnessed.adapter.launches.map((launch) => launch.tmuxName)).toEqual([
@@ -934,6 +934,16 @@ describe('retention prune', () => {
   });
 });
 
+/**
+ * Runs a sweep the way the supervision tick does — one reading of the fleet, handed
+ * in — so a test never has to think about who lists what.
+ */
+const sweepHung = async (harnessed: Harness): Promise<readonly HangOutcome[]> =>
+  harnessed.service.sweepHung(await harnessed.service.readFleet());
+
+const sweepIdle = async (harnessed: Harness): Promise<readonly IdleOutcome[]> =>
+  harnessed.service.sweepIdle(await harnessed.service.readFleet());
+
 /** A running record with a correlated host session that reports itself idle. */
 const idleSession = (pid = 4242): HostSession =>
   hostSession({ cwd: '/repos/example', pid, sessionId: 'sid-1', startedAt: NOW, status: 'idle' });
@@ -949,7 +959,7 @@ describe('idle timeout', () => {
       harnessed.adapter.hostSessions = [idleSession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 35 * MINUTE };
 
-      const outcomes = await harnessed.service.sweepIdle();
+      const outcomes = await sweepIdle(harnessed);
 
       expect(outcomes).toEqual([
         { id: 'id1', reason: 'idle for 35 minutes; stopped by the idle timeout' },
@@ -978,32 +988,30 @@ describe('idle timeout', () => {
       harnessed.adapter.hostSessions = [idleSession()];
       harnessed.adapter.transcripts = { 'sid-1': NOW - 35 * MINUTE };
 
-      await harnessed.service.sweepIdle();
+      await sweepIdle(harnessed);
       harnessed.at(NOW + 10 * MINUTE);
-      expect(await harnessed.service.sweepIdle()).toEqual([]);
+      expect(await sweepIdle(harnessed)).toEqual([]);
 
       expect((await harnessed.store.load())[0]?.endedAt).toBe(NOW);
     });
   });
 
-  test('does nothing at all when the timeout is not configured', async () => {
+  test('reads nothing and stops nothing when the timeout is not configured', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, [hung({ id: 'id1' })]);
       harnessed.adapter.liveNames = ['ccrc-example-1'];
       harnessed.adapter.hostSessions = [idleSession()];
-      harnessed.adapter.transcripts = { 'sid-1': NOW - 10 * DAY };
-      let fleetReads = 0;
-      harnessed.adapter.listDelay = () => {
-        fleetReads += 1;
-        return Promise.resolve();
-      };
+      // A transcript probe would throw rather than answer, so any attempt to judge
+      // this session leaves a line in the log. Off means the question is never asked.
+      harnessed.adapter.transcriptFailure = new Error('EIO');
 
-      expect(await harnessed.service.sweepIdle()).toEqual([]);
+      expect(await harnessed.service.sweepIdle([idleSession()])).toEqual([]);
 
-      // Off means off: no fleet listing, no transcript reads, no work at all.
-      expect(fleetReads).toBe(0);
+      expect(harnessed.log.errors).toEqual([]);
       expect(harnessed.adapter.stopped).toEqual([]);
-      expect((await harnessed.store.load())[0]?.status).toBe('running');
+      const stored = (await harnessed.store.load())[0];
+      expect(stored?.status).toBe('running');
+      expect(stored?.stopReason).toBeNull();
     });
   });
 
@@ -1015,27 +1023,10 @@ describe('idle timeout', () => {
       harnessed.adapter.transcripts = { 'sid-1': NOW - 35 * MINUTE };
       harnessed.adapter.stopOutcome = new StopError('operation not permitted');
 
-      expect(await harnessed.service.sweepIdle()).toEqual([]);
+      expect(await sweepIdle(harnessed)).toEqual([]);
 
       expect((await harnessed.store.load())[0]?.status).toBe('running');
       expect(harnessed.log.errors.join('')).toMatch(/tmux refused to kill it/);
-    });
-  });
-
-  test('skips the sweep when the host fleet cannot be listed', async () => {
-    await withTempDir(async (dir) => {
-      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
-      harnessed.adapter.liveNames = ['ccrc-example-1'];
-      harnessed.adapter.listFailure = new CommandTimeoutError(
-        'claude did not finish within 30000ms and was killed',
-      );
-
-      // Not "nothing is idle", and certainly not "everything is": the tick gives up.
-      const failure = await rejection(harnessed.service.sweepIdle());
-
-      expect(failure).toBeInstanceOf(CommandTimeoutError);
-      expect(harnessed.adapter.stopped).toEqual([]);
-      expect((await harnessed.store.load())[0]?.status).toBe('running');
     });
   });
 });
@@ -1084,7 +1075,7 @@ describe('idle timeout restraint', () => {
       harnessed.adapter.hostSessions = [session];
       harnessed.adapter.transcripts = transcripts ?? { 'sid-1': NOW - 60 * MINUTE };
 
-      expect(await harnessed.service.sweepIdle()).toEqual([]);
+      expect(await sweepIdle(harnessed)).toEqual([]);
 
       expect(harnessed.adapter.stopped).toEqual([]);
       const stored = (await harnessed.store.load())[0];
@@ -1100,10 +1091,102 @@ describe('idle timeout restraint', () => {
       harnessed.adapter.hostSessions = [idleSession()];
       harnessed.adapter.transcriptFailure = new Error('EIO');
 
-      expect(await harnessed.service.sweepIdle()).toEqual([]);
+      expect(await sweepIdle(harnessed)).toEqual([]);
 
       expect(harnessed.adapter.stopped).toEqual([]);
       expect(harnessed.log.errors.join('')).toMatch(/could not read the transcript of session id1/);
+    });
+  });
+});
+
+/** Hang threshold above the staleness, idle timeout below it: the gap in between. */
+const TRANSITION_TOML = `${CONFIG_TOML}idle_timeout_minutes = 5\n`;
+
+/** Counts what the tick asks the host for, and lets a test change the answer. */
+const countingFleet = (
+  harnessed: Harness,
+): { reads: () => number; onRead: (handler: () => void) => void } => {
+  let reads = 0;
+  let handler: (() => void) | undefined;
+  harnessed.adapter.listDelay = () => {
+    reads += 1;
+    handler?.();
+    return Promise.resolve();
+  };
+  return { onRead: (next) => (handler = next), reads: () => reads };
+};
+
+const runTick = async (harnessed: Harness): Promise<void> => {
+  const supervisor = startSupervisor({
+    intervalMs: 30_000,
+    logger: harnessed.log.logger,
+    service: harnessed.service,
+    ticker: () => () => undefined,
+  });
+  await supervisor.started;
+  supervisor.stop();
+};
+
+describe('one fleet listing per tick', () => {
+  test('serves both sweeps from a single reading of the host fleet', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [idleSession()];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 60_000 };
+      const fleet = countingFleet(harnessed);
+
+      await runTick(harnessed);
+
+      // Reconciliation reads the fleet once and the two sweeps share one more
+      // between them. Three readings would mean the sweeps judge different instants.
+      expect(fleet.reads()).toBe(2);
+    });
+  });
+
+  test('never stops a session that was busy when the tick looked', async () => {
+    await withTempDir(async (dir) => {
+      // The scenario exactly: a turn finishes between one listing and the next.
+      // Transcript 7 minutes stale, hang threshold 10, idle timeout 5 — so the
+      // watchdog rightly declines, and an idle sweep with its own later listing
+      // would bill the whole 7 minutes as idleness and kill a turn that just ended.
+      const harnessed = await harness(dir, [hung({ id: 'id1' })], undefined, TRANSITION_TOML);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.hostSessions = [{ ...idleSession(), status: 'busy' }];
+      harnessed.adapter.transcripts = { 'sid-1': NOW - 7 * MINUTE };
+      const fleet = countingFleet(harnessed);
+      fleet.onRead(() => {
+        // The turn ends after the tick's first two readings — reconciliation's, and
+        // the one the sweeps are meant to share. Anything read beyond that is a
+        // second sweep listing, and it says the session has gone idle.
+        if (fleet.reads() >= 3) {
+          harnessed.adapter.hostSessions = [idleSession()];
+        }
+      });
+
+      await runTick(harnessed);
+
+      expect(harnessed.adapter.stopped).toEqual([]);
+      const stored = (await harnessed.store.load())[0];
+      expect(stored?.status).toBe('running');
+      expect(stored?.stopReason).toBeNull();
+    });
+  });
+
+  test('skips both sweeps when the fleet cannot be listed at all', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await idleHarness(dir, [hung({ id: 'id1' })]);
+      harnessed.adapter.liveNames = ['ccrc-example-1'];
+      harnessed.adapter.listFailure = new CommandTimeoutError(
+        'claude did not finish within 30000ms and was killed',
+      );
+
+      await runTick(harnessed);
+
+      // Neither sweep may guess: not "nothing is hung", not "nothing is idle".
+      expect(harnessed.adapter.stopped).toEqual([]);
+      expect((await harnessed.store.load())[0]?.status).toBe('running');
+      expect(harnessed.log.errors.join('')).toMatch(/could not read the host fleet/);
     });
   });
 });

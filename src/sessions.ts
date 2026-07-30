@@ -68,10 +68,17 @@ export type SessionService = {
   readonly stop: (id: string) => Promise<SessionView>;
   /** Bring records back in line with tmux. Reads do this; so does the supervisor. */
   readonly reconcile: () => Promise<SessionListing>;
+  /**
+   * One reading of the host fleet, for a caller that is about to run both sweeps
+   * against it. They have to judge the same instant: a session that finishes a turn
+   * between two listings is busy in one and idle in the next, and an idle sweep
+   * holding the later listing would bill the whole busy stretch as idleness.
+   */
+  readonly readFleet: () => Promise<readonly HostSession[]>;
   /** Retire sessions that claim to be working but have stopped writing anything. */
-  readonly sweepHung: () => Promise<readonly HangOutcome[]>;
+  readonly sweepHung: (fleet: readonly HostSession[]) => Promise<readonly HangOutcome[]>;
   /** Stop sessions that have sat idle past the configured timeout. */
-  readonly sweepIdle: () => Promise<readonly IdleOutcome[]>;
+  readonly sweepIdle: (fleet: readonly HostSession[]) => Promise<readonly IdleOutcome[]>;
   /** Drop terminal records past the retention window; returns how many went. */
   readonly prune: () => Promise<number>;
 };
@@ -888,13 +895,22 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { id: record.id, reason, restartedAs: replacement };
   };
 
-  const sweepHung = async (): Promise<readonly HangOutcome[]> => {
+  const readFleet = (): Promise<readonly HostSession[]> => adapter.listHostSessions();
+
+  /**
+   * The fleet is handed in rather than read here, so this and the idle sweep judge
+   * the same instant. Records are re-loaded, though: the watchdog runs first and its
+   * retirements have to be visible, or a session it just retired would be swept
+   * again by the idle pass.
+   */
+  const sweepHung = async (
+    hostSessions: readonly HostSession[],
+  ): Promise<readonly HangOutcome[]> => {
     const records = await store.load();
     const running = records.filter((record) => record.status === 'running');
     if (running.length === 0) {
       return [];
     }
-    const hostSessions = await adapter.listHostSessions();
     const checked = await Promise.all(
       running.map(async (record) => {
         const session = correlate(record, hostSessions, records);
@@ -943,12 +959,15 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
   };
 
   /**
-   * Unset means off, and off means nothing is read at all — no fleet listing, no
-   * transcripts, no store. A fleet listing that fails takes the sweep down with it
-   * rather than answering "nothing is idle": the tick's own error isolation catches
-   * that, and the next tick asks again.
+   * Unset means off, and off means no work: no records read, no transcripts probed,
+   * nothing stopped. The fleet comes from the same reading the hang watchdog judged,
+   * so a session that was busy a moment ago cannot be billed for that time as
+   * idleness — and records are re-loaded here, so anything the watchdog just retired
+   * is no longer `running` and is left alone.
    */
-  const sweepIdle = async (): Promise<readonly IdleOutcome[]> => {
+  const sweepIdle = async (
+    hostSessions: readonly HostSession[],
+  ): Promise<readonly IdleOutcome[]> => {
     const { idleTimeoutMs } = config.supervision;
     if (idleTimeoutMs === null) {
       return [];
@@ -958,7 +977,6 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     if (running.length === 0) {
       return [];
     }
-    const hostSessions = await adapter.listHostSessions();
     const checked = await Promise.all(
       running.map(async (record) => {
         const session = correlate(record, hostSessions, records);
@@ -995,5 +1013,16 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         : { records: kept, result: records.length - kept.length };
     });
 
-  return { get, launch, list, listRepos, prune, reconcile, stop, sweepHung, sweepIdle };
+  return {
+    get,
+    launch,
+    list,
+    listRepos,
+    prune,
+    readFleet,
+    reconcile,
+    stop,
+    sweepHung,
+    sweepIdle,
+  };
 };

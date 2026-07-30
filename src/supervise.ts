@@ -1,3 +1,4 @@
+import type { HostSession } from './adapter/claude.ts';
 import { messageOf } from './errors.ts';
 import { createLogger } from './log.ts';
 import type { Logger } from './log.ts';
@@ -88,8 +89,28 @@ export const startSupervisor = (options: SuperviseOptions): Supervisor => {
     skipped = 0;
     try {
       await phase('reconcile records against tmux', () => service.reconcile());
-      await phase('check for hung sessions', () => service.sweepHung());
-      await phase('stop idle sessions', () => service.sweepIdle());
+      /**
+       * One reading of the host fleet for both sweeps, in a phase of its own.
+       *
+       * They have to judge the same instant. A session that finishes a turn between
+       * two listings reads as busy in one and idle in the next, and an idle sweep
+       * holding the later listing would charge it for the whole stretch it spent
+       * working — killing a turn that had just ended. A single listing cannot say
+       * both things at once.
+       *
+       * A listing that fails skips both sweeps rather than letting either guess from
+       * a fleet it never saw. Each sweep keeps its own error isolation: one failing
+       * does not take the other down with it, or stop the prune from running.
+       */
+      let fleet: readonly HostSession[] | undefined;
+      await phase('read the host fleet', async () => {
+        fleet = await service.readFleet();
+      });
+      if (fleet !== undefined) {
+        const sessions = fleet;
+        await phase('check for hung sessions', () => service.sweepHung(sessions));
+        await phase('stop idle sessions', () => service.sweepIdle(sessions));
+      }
       await phase('prune old records', async () => {
         const pruned = await service.prune();
         if (pruned > 0) {
