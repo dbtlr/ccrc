@@ -38,7 +38,11 @@ export type RepoSummary = {
 export type HangOutcome = {
   readonly id: string;
   readonly reason: string;
-  /** The replacement's id, or `null` when nothing was started in its place. */
+  /**
+   * The replacement record's id — including one whose launch failed, since that
+   * record exists and is where the session went — or `null` when no replacement was
+   * attempted at all.
+   */
   readonly restartedAs: string | null;
 };
 
@@ -339,6 +343,8 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     readonly prompt?: string | undefined;
     readonly restartedFrom?: string | null;
     readonly restarts?: readonly number[];
+    /** Called once the record exists, so a caller can name it even if the launch fails. */
+    readonly onPending?: (record: SessionRecord) => void;
   }): Promise<{
     readonly record: SessionRecord;
     readonly records: readonly SessionRecord[];
@@ -373,6 +379,7 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       };
       return { records: [...records, record], result: record };
     });
+    start.onPending?.(pending);
 
     /**
      * The settled record is built inside the store's critical section, so the pid
@@ -645,26 +652,35 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
      * then reads that entry's stale transcript as the replacement hanging.
      */
     await retire(record.id, `${symptom}; a replacement is being started`, null, session);
-    let replacement: string | null = null;
+    // The replacement's id is captured as soon as its record exists, so a launch
+    // that fails still leaves the two records pointing at each other — a dead end on
+    // one side hides where the session went.
+    const attempt: { id: string | null; started: boolean } = { id: null, started: false };
     try {
       // The replacement inherits this record's restart history plus this restart, so
       // the cap is enforced against the live record alone.
-      replacement = (
-        await startSession({
-          repo,
-          restartedFrom: record.id,
-          restarts: [...already, now()],
-        })
-      ).record.id;
+      await startSession({
+        onPending: (pending) => {
+          attempt.id = pending.id;
+        },
+        repo,
+        restartedFrom: record.id,
+        restarts: [...already, now()],
+      });
+      attempt.started = true;
     } catch (cause) {
       logger.error(
         `ccrcd stopped hung session ${record.id} but could not start its replacement: ${messageOf(cause)}`,
       );
     }
-    if (replacement === null) {
-      const reason = `${symptom}; the replacement session could not be started`;
-      await retire(record.id, reason, null, session);
-      return { id: record.id, reason, restartedAs: null };
+    const replacement = attempt.id;
+    if (!attempt.started) {
+      const reason =
+        replacement === null
+          ? `${symptom}; a replacement session could not be created`
+          : `${symptom}; its replacement ${replacement} failed to start`;
+      await retire(record.id, reason, replacement, session);
+      return { id: record.id, reason, restartedAs: replacement };
     }
     const reason = `${symptom}; restarted as ${replacement}`;
     await retire(record.id, reason, replacement, session);

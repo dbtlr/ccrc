@@ -331,11 +331,15 @@ describe('hang watchdog', () => {
 
       const outcomes = await harnessed.service.sweepHung();
 
-      expect(outcomes[0]?.restartedAs).toBeNull();
-      expect(outcomes[0]?.reason).toMatch(/replacement session could not be started/);
+      // The replacement exists as a failed record, so the pair still cross-links
+      // both ways: a record pointing at nothing hides where the session went.
+      expect(outcomes[0]?.restartedAs).toBe('new1');
+      expect(outcomes[0]?.reason).toMatch(/replacement new1 failed to start/);
       const stored = await harnessed.store.load();
       expect(byId(stored, 'id1')?.status).toBe('stopped');
+      expect(byId(stored, 'id1')?.restartedAs).toBe('new1');
       expect(byId(stored, 'new1')?.status).toBe('failed');
+      expect(byId(stored, 'new1')?.restartedFrom).toBe('id1');
       expect(harnessed.log.errors.join('')).toMatch(/could not start its replacement/);
     });
   });
