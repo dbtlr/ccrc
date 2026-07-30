@@ -200,6 +200,41 @@ describe('reboot reconciliation', () => {
     });
   });
 
+  test('lets a new session take a pid the OS reused after an old record ended', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [
+        // Ended days ago, still kept by retention, still claiming pid 4242.
+        sessionRecord({
+          endedAt: NOW - 3 * DAY,
+          hostSessionId: 'sid-old',
+          id: 'id1',
+          pid: 4242,
+          startedAt: NOW - 4 * DAY,
+          status: 'stopped',
+          tmuxName: 'ccrc-example-1',
+        }),
+        sessionRecord({ id: 'id2', pid: null, status: 'running', tmuxName: 'ccrc-example-2' }),
+      ]);
+      harnessed.adapter.liveNames = ['ccrc-example-2'];
+      // The OS handed the same pid to something started long after id1 ended.
+      harnessed.adapter.hostSessions = [
+        hostSession({
+          cwd: '/repos/example',
+          pid: 4242,
+          sessionId: 'sid-new',
+          startedAt: NOW,
+          status: 'idle',
+        }),
+      ];
+
+      const listing = await harnessed.service.reconcile();
+
+      // Without correlation the live session reports no activity and the watchdog can
+      // never see it at all — for as long as retention keeps the dead record.
+      expect(listing.sessions.find((session) => session.id === 'id2')?.activity).toBe('idle');
+    });
+  });
+
   test('leaves records alone when tmux cannot say what is live', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, [sessionRecord({ id: 'id1', status: 'running' })]);

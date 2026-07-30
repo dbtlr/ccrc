@@ -154,6 +154,36 @@ const startedTogether = (session: HostSession, record: SessionRecord): boolean =
  * as the record, and it is the only one left — anything ambiguous correlates to
  * nothing at all.
  */
+/**
+ * Whether another record already owns this host entry.
+ *
+ * A killed session lingers in `claude agents --json`, and its record keeps the pid
+ * and session id it was killed with precisely so the next session in that repo
+ * cannot adopt them: inheriting a dead session's busy report and stopped-moving
+ * transcript is a hang as far as the watchdog can tell, so a healthy replacement
+ * would be killed next tick, and its replacement after that.
+ *
+ * A dead record's claim expires with the session, though. The OS reuses pids, and a
+ * record kept for the retention window would otherwise make a legitimate new session
+ * uncorrelatable for days — no activity of its own, and no hang coverage. So a record
+ * that has ended only claims entries that existed before it did: an entry that
+ * started afterwards cannot be the session it was holding. An entry that will not say
+ * when it started stays claimed, because the alternative guesses in the dangerous
+ * direction.
+ */
+const isClaimed = (session: HostSession, others: readonly SessionRecord[]): boolean =>
+  others.some((other) => {
+    const mine =
+      (other.pid !== null && other.pid === session.pid) ||
+      (other.hostSessionId !== null && other.hostSessionId === session.sessionId);
+    if (!mine) {
+      return false;
+    }
+    return other.endedAt === null || session.startedAt === null
+      ? true
+      : session.startedAt <= other.endedAt;
+  });
+
 const correlate = (
   record: SessionRecord,
   hostSessions: readonly HostSession[],
@@ -165,26 +195,11 @@ const correlate = (
       return byPid;
     }
   }
-  /**
-   * Identifiers another record has already claimed — including a retired one's. A
-   * killed session lingers in `claude agents --json` for a while, and its record
-   * keeps the pid and session id it was killed with precisely so the replacement
-   * cannot adopt them: inheriting a dead session's busy report and stopped-moving
-   * transcript is a hang as far as the watchdog can tell, so the healthy
-   * replacement would be killed next tick, and its replacement after that.
-   */
   const others = records.filter((other) => other.id !== record.id);
-  const claimedPids = new Set<number>(
-    others.map((other) => other.pid).filter((pid): pid is number => pid !== null),
-  );
-  const claimedSessions = new Set<string>(
-    others.map((other) => other.hostSessionId).filter((id): id is string => id !== null),
-  );
   const candidates = hostSessions.filter(
     (session) =>
       session.cwd === record.repoPath &&
-      (session.pid === null || !claimedPids.has(session.pid)) &&
-      (session.sessionId === null || !claimedSessions.has(session.sessionId)) &&
+      !isClaimed(session, others) &&
       startedTogether(session, record),
   );
   return candidates.length === 1 ? candidates[0] : undefined;
