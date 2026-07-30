@@ -85,7 +85,7 @@ describe('workspace scan', () => {
         logger: harnessed.log.logger,
       });
 
-      expect((await registry.list()).map((entry) => entry.name)).toEqual([
+      expect((await registry.list()).repos.map((entry) => entry.name)).toEqual([
         'example',
         'alpha',
         'beta',
@@ -103,7 +103,7 @@ describe('workspace scan', () => {
         logger: harnessed.log.logger,
       });
 
-      expect((await registry.list()).map((entry) => entry.name)).toEqual(['example']);
+      expect((await registry.list()).repos.map((entry) => entry.name)).toEqual(['example']);
       expect(harnessed.log.errors).toEqual([]);
     });
   });
@@ -120,7 +120,7 @@ describe('workspace scan', () => {
         logger: harnessed.log.logger,
       });
 
-      expect((await registry.list()).map((entry) => entry.name)).toEqual(['example']);
+      expect((await registry.list()).repos.map((entry) => entry.name)).toEqual(['example']);
       expect(await registry.find('anything')).toBeUndefined();
     });
   });
@@ -136,7 +136,7 @@ describe('workspace scan', () => {
         logger: harnessed.log.logger,
       });
 
-      expect(await registry.list()).toEqual([{ name: 'example', path: '/repos/example' }]);
+      expect((await registry.list()).repos).toEqual([{ name: 'example', path: '/repos/example' }]);
       expect((await registry.find('example'))?.path).toBe('/repos/example');
       await registry.list();
       await registry.list();
@@ -175,10 +175,13 @@ describe('workspace scan', () => {
         logger: harnessed.log.logger,
       });
 
-      // An unreadable root makes the registry unknown, not smaller. Answering with
-      // the configured repos alone would read as "your workspaces are gone".
-      const listing = await rejection(registry.list());
-      expect(listing).toBeInstanceOf(WorkspaceError);
+      // The configured repos are known whatever the filesystem is doing, so they are
+      // still offered — with the half that could not be read named rather than
+      // quietly missing.
+      expect(await registry.list()).toEqual({
+        repos: [{ name: 'example', path: '/repos/example' }],
+        workspacesUnavailable: true,
+      });
       expect(harnessed.log.errors.join('')).toMatch(/could not scan the workspaces root/);
 
       // A configured repo still resolves: nothing about it depends on the scan.
@@ -349,7 +352,10 @@ describe('workspace creation', () => {
 
       await service.create('first');
 
-      expect((await registry.list()).map((entry) => entry.name)).toEqual(['example', 'first']);
+      expect((await registry.list()).repos.map((entry) => entry.name)).toEqual([
+        'example',
+        'first',
+      ]);
     });
   });
 
@@ -546,7 +552,7 @@ describe('workspace creation', () => {
       const creating = service.create('slow');
       await Bun.sleep(1);
 
-      expect((await registry.list()).map((entry) => entry.name)).toEqual(['example']);
+      expect((await registry.list()).repos.map((entry) => entry.name)).toEqual(['example']);
       // It is staged under a name the scan skips, not under the name it will have.
       const staged = await readdir(harnessed.root);
       expect(staged).toHaveLength(1);
@@ -555,7 +561,7 @@ describe('workspace creation', () => {
       initialising.resolve(ok());
       await creating;
 
-      expect((await registry.list()).map((entry) => entry.name)).toEqual(['example', 'slow']);
+      expect((await registry.list()).repos.map((entry) => entry.name)).toEqual(['example', 'slow']);
       expect(await readdir(harnessed.root)).toEqual(['slow']);
     });
   });

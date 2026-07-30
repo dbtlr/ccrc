@@ -28,9 +28,16 @@ export type WorkspaceSummary = {
 /** Whether a repo path is still there. `unknown` when the host would not say. */
 export type PathState = 'present' | 'missing' | 'unknown';
 
+/** Everything launchable right now, and whether that answer is the whole of it. */
+export type RegistryListing = {
+  readonly repos: readonly RepoEntry[];
+  /** True when the workspaces root could not be read, so the list is short. */
+  readonly workspacesUnavailable: boolean;
+};
+
 /** Where `launch` looks a repo name up. Config-only unless a root is configured. */
 export type RepoRegistry = {
-  readonly list: () => Promise<readonly RepoEntry[]>;
+  readonly list: () => Promise<RegistryListing>;
   readonly find: (name: string) => Promise<RepoEntry | undefined>;
   /**
    * Whether a path a record was launched from is still usable. The watchdog asks
@@ -109,8 +116,21 @@ export const createRepoRegistry = (options: RegistryOptions): RepoRegistry => {
     }
   };
 
-  const list = async (): Promise<readonly RepoEntry[]> => {
-    const scanned = await scan();
+  /**
+   * A listing is not all-or-nothing. The configured repos are known whatever the
+   * filesystem is doing and they still launch, so they are still offered; what is
+   * missing is named instead of being passed off as an empty root. Refusing the whole
+   * list would leave the console with an empty picker and no way to launch the repos
+   * that are demonstrably fine.
+   */
+  const list = async (): Promise<RegistryListing> => {
+    let scanned: readonly string[];
+    try {
+      scanned = await scan();
+    } catch {
+      // Already logged where it happened.
+      return { repos: config.repos, workspacesUnavailable: true };
+    }
     const configured = new Set(config.repos.map((repo) => repo.name));
     const workspaces: RepoEntry[] = [];
     for (const name of scanned) {
@@ -125,7 +145,7 @@ export const createRepoRegistry = (options: RegistryOptions): RepoRegistry => {
       }
       workspaces.push({ name, path: join(root ?? '', name) });
     }
-    return [...config.repos, ...workspaces];
+    return { repos: [...config.repos, ...workspaces], workspacesUnavailable: false };
   };
 
   /**

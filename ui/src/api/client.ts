@@ -23,6 +23,12 @@ export type Repo = {
   readonly name: string;
 };
 
+/** The launchable list, plus whether the daemon could read all of it. */
+export type Registry = {
+  readonly repos: Repo[];
+  readonly workspacesUnavailable: boolean;
+};
+
 export type LaunchRequest = {
   readonly repo: string;
   readonly prompt?: string | undefined;
@@ -118,8 +124,13 @@ const JSON_HEADERS = { 'content-type': 'application/json' };
 export const fetchSessions = async (): Promise<Session[]> =>
   collect(await request('/sessions'), 'sessions', toSession);
 
-export const fetchRepos = async (): Promise<Repo[]> =>
-  collect(await request('/repos'), 'repos', toRepo);
+export const fetchRepos = async (): Promise<Registry> => {
+  const body = await request('/repos');
+  return {
+    repos: collect(body, 'repos', toRepo),
+    workspacesUnavailable: isRecord(body) && body.workspacesUnavailable === true,
+  };
+};
 
 export const launchSession = async (input: LaunchRequest): Promise<Session | null> =>
   toSession(

@@ -34,7 +34,7 @@ export const DispatchForm = ({
   onLaunch,
 }: DispatchFormProps): JSX.Element => {
   const { data, isPending } = useRepos();
-  const repos = data ?? [];
+  const repos = data?.repos ?? [];
   const [repo, setRepo] = useState('');
   const [name, setName] = useState('');
   const [prompt, setPrompt] = useState('');

@@ -9,7 +9,7 @@ import {
   launchSession,
   stopSession,
 } from './client.ts';
-import type { LaunchRequest, Repo, Session, Workspace } from './client.ts';
+import type { LaunchRequest, Registry, Session, Workspace } from './client.ts';
 
 const SESSIONS_KEY = ['sessions'];
 const REPOS_KEY = ['repos'];
@@ -56,7 +56,7 @@ export const useSessions = (): UseQueryResult<Session[]> => {
  * root, scanned per request. It is not polled: creating a workspace here refreshes
  * it, and a directory made outside the console appears on the next page load.
  */
-export const useRepos = (): UseQueryResult<Repo[]> =>
+export const useRepos = (): UseQueryResult<Registry> =>
   useQuery({ queryFn: fetchRepos, queryKey: REPOS_KEY, staleTime: Infinity });
 
 export const useCreateWorkspace = (): UseMutationResult<Workspace, Error, string> => {

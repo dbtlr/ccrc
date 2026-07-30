@@ -48,7 +48,7 @@ type Harness = {
 const pathRegistry = (state: PathState): RepoRegistry => ({
   checkPath: () => Promise.resolve(state),
   find: (name) => Promise.resolve(findRepo(harnessConfig, name)),
-  list: () => Promise.resolve(harnessConfig?.repos ?? []),
+  list: () => Promise.resolve({ repos: harnessConfig?.repos ?? [], workspacesUnavailable: false }),
 });
 
 let harnessConfig: Config;
@@ -649,7 +649,11 @@ describe('hang watchdog', () => {
       const repointed: RepoRegistry = {
         checkPath: () => Promise.resolve('present'),
         find: () => Promise.resolve({ name: 'example', path: '/repos/impostor' }),
-        list: () => Promise.resolve([{ name: 'example', path: '/repos/impostor' }]),
+        list: () =>
+          Promise.resolve({
+            repos: [{ name: 'example', path: '/repos/impostor' }],
+            workspacesUnavailable: false,
+          }),
       };
       const harnessed = await harness(dir, [hung({ id: 'id1' })], repointed);
       harnessed.adapter.liveNames = ['ccrc-example-1'];

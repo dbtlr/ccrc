@@ -36,6 +36,12 @@ export type RepoSummary = {
   readonly name: string;
 };
 
+/** The registry as a client sees it, including what ccrcd could not read. */
+export type RepoListing = {
+  readonly repos: readonly RepoSummary[];
+  readonly workspacesUnavailable: boolean;
+};
+
 /** What the hang watchdog did about one session, for logging and for tests. */
 export type HangOutcome = {
   readonly id: string;
@@ -49,7 +55,7 @@ export type HangOutcome = {
 };
 
 export type SessionService = {
-  readonly listRepos: () => Promise<readonly RepoSummary[]>;
+  readonly listRepos: () => Promise<RepoListing>;
   readonly launch: (input: LaunchInput) => Promise<SessionView>;
   readonly list: () => Promise<SessionListing>;
   readonly get: (id: string) => Promise<SessionView>;
@@ -585,8 +591,13 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
    * by ccrcd, by `git clone`, or by hand — is launchable immediately, and nothing has
    * to be kept in step with the filesystem.
    */
-  const listRepos = async (): Promise<readonly RepoSummary[]> =>
-    (await registry.list()).map((repo) => ({ name: repo.name }));
+  const listRepos = async (): Promise<RepoListing> => {
+    const listing = await registry.list();
+    return {
+      repos: listing.repos.map((repo) => ({ name: repo.name })),
+      workspacesUnavailable: listing.workspacesUnavailable,
+    };
+  };
 
   const list = (): Promise<SessionListing> => reconcile();
 

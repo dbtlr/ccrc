@@ -62,12 +62,23 @@ export const Board = (): JSX.Element => {
     [create, launch, stop],
   );
 
+  /**
+   * A root the daemon cannot read is not a failed request — the configured repos are
+   * still listed and still launch — so it reports as the same notice everything else
+   * does, behind whatever went wrong more recently.
+   */
+  const workspacesUnavailable =
+    repos.data?.workspacesUnavailable === true
+      ? 'ccrcd could not read the workspaces root, so only configured repos are listed.'
+      : undefined;
+
   const failure =
     create.error?.message ??
     launch.error?.message ??
     stop.error?.message ??
     repos.error?.message ??
-    sessions.error?.message;
+    sessions.error?.message ??
+    workspacesUnavailable;
   const dismiss = useCallback(() => setDismissed(failure ?? ''), [failure]);
   const showing = failure === undefined || failure === dismissed ? undefined : failure;
 

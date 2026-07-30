@@ -341,6 +341,7 @@ describe('repo registry', () => {
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({
         repos: [{ name: 'example' }, { name: 'Side Project' }],
+        workspacesUnavailable: false,
       });
     });
   });
@@ -356,11 +357,12 @@ describe('repo registry', () => {
 
       expect(await response.json()).toEqual({
         repos: [{ name: 'example' }, { name: 'Side Project' }, { name: 'scanned' }],
+        workspacesUnavailable: false,
       });
     });
   });
 
-  test('answers 502 when the workspaces root cannot be read', async () => {
+  test('lists what it still knows, and says so, when the root cannot be read', async () => {
     await withTempDir(async (dir) => {
       const root = join(dir, 'workspaces');
       // A file where the root should be: the scan cannot say what is launchable.
@@ -368,10 +370,26 @@ describe('repo registry', () => {
       const harnessed = await harness(dir, withWorkspaces(root));
 
       const listed = await harnessed.app.request('/repos');
+
+      // The configured repos are known and still launch, so they are still offered —
+      // with the missing half named rather than passed off as an empty list.
+      expect(listed.status).toBe(200);
+      expect(await listed.json()).toEqual({
+        repos: [{ name: 'example' }, { name: 'Side Project' }],
+        workspacesUnavailable: true,
+      });
+    });
+  });
+
+  test('still refuses to launch an unlisted name while the root cannot be read', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      await Bun.write(root, 'not a directory\n');
+      const harnessed = await harness(dir, withWorkspaces(root));
+
       const launched = await postSession(harnessed, { repo: 'anything' });
 
-      // Not "here are the config repos", and not "no such repo" — neither is known.
-      expect(listed.status).toBe(502);
+      // Not "no such repo": the host would not say, and a launch may not guess.
       expect(launched.status).toBe(502);
       expect(harnessed.adapter.launches).toEqual([]);
     });
@@ -406,7 +424,7 @@ describe('repo registry', () => {
       const response = await harnessed.app.request('/repos');
 
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ repos: [] });
+      expect(await response.json()).toEqual({ repos: [], workspacesUnavailable: false });
     });
   });
 });
