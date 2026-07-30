@@ -31,6 +31,19 @@ export type HealthService = {
 /** Short on purpose: health has to answer while the thing it describes is happening. */
 export const HEALTH_TIMEOUT_MS = 2_000;
 
+/**
+ * How long one set of answers is reused.
+ *
+ * `/healthz` is a plain unauthenticated `GET`, and each run of it spawns processes —
+ * `claude --version`, `tmux list-sessions`, a probe write. Without a cache, anything
+ * that can reach the daemon (including a page the operator happened to open, since a
+ * read needs no origin) turns request volume into process volume. Concurrent callers
+ * share one run and the answer stands for a few seconds, which bounds the spawn rate
+ * no matter how hard the route is hit. A few seconds of staleness is nothing next to
+ * a monitor's polling interval.
+ */
+export const HEALTH_CACHE_TTL_MS = 5_000;
+
 /** Runs `fire` after `ms` and returns its cancel — `setTimeout`, injectable. */
 export type OneShotTimer = (ms: number, fire: () => void) => () => void;
 
@@ -45,12 +58,18 @@ export type HealthOptions = {
   readonly logger?: Logger;
   readonly timeoutMs?: number;
   readonly timer?: OneShotTimer;
+  readonly cacheTtlMs?: number;
+  readonly now?: () => number;
 };
 
 export const createHealthService = (options: HealthOptions): HealthService => {
   const logger = options.logger ?? createLogger();
   const timeoutMs = options.timeoutMs ?? HEALTH_TIMEOUT_MS;
   const timer = options.timer ?? defaultTimer;
+  const cacheTtlMs = options.cacheTtlMs ?? HEALTH_CACHE_TTL_MS;
+  const now = options.now ?? Date.now;
+  let cached: { readonly at: number; readonly report: HealthReport } | undefined;
+  let inFlight: Promise<HealthReport> | undefined;
 
   /**
    * The reason a probe failed is logged, never served: a probe failure quotes host
@@ -77,7 +96,7 @@ export const createHealthService = (options: HealthOptions): HealthService => {
     }
   };
 
-  const check = async (): Promise<HealthReport> => {
+  const probeAll = async (): Promise<HealthReport> => {
     const [claude, state, tmux] = await Promise.all([
       bounded('claude', () => options.adapter.checkClaude()),
       bounded('state', () => checkWritable(options.statePath)),
@@ -87,6 +106,25 @@ export const createHealthService = (options: HealthOptions): HealthService => {
       checks: { claude, state, tmux },
       ok: claude === 'ok' && state === 'ok' && tmux === 'ok',
     };
+  };
+
+  /** One run at a time; the answer is remembered for `cacheTtlMs`. */
+  const refresh = async (): Promise<HealthReport> => {
+    try {
+      const report = await probeAll();
+      cached = { at: now(), report };
+      return report;
+    } finally {
+      inFlight = undefined;
+    }
+  };
+
+  const check = (): Promise<HealthReport> => {
+    if (cached !== undefined && now() - cached.at < cacheTtlMs) {
+      return Promise.resolve(cached.report);
+    }
+    inFlight ??= refresh();
+    return inFlight;
   };
 
   return { check };

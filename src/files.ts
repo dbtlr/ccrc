@@ -45,10 +45,15 @@ export const checkWritable = async (path: string): Promise<void> => {
   const probe = `${target}.ccrcd-health-${crypto.randomUUID().slice(0, 8)}.tmp`;
   try {
     await writeFile(probe, '', { mode: DEFAULT_FILE_MODE });
-    await rm(probe, { force: true });
-  } catch (cause) {
-    await rm(probe, { force: true });
-    throw cause;
+  } finally {
+    // Removal is best-effort. A failure here is not the answer the caller asked for
+    // and must not replace the write failure that is: the name is unique, so the
+    // worst case is one stray probe file rather than a misreported health check.
+    try {
+      await rm(probe, { force: true });
+    } catch {
+      // Nothing useful to do about it at this level.
+    }
   }
 };
 
