@@ -1,4 +1,5 @@
 import { lstat, mkdir, readdir, realpath, rename, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { ConflictError, WorkspaceError } from '../errors.ts';
 import { createLogger } from '../log.ts';
@@ -31,13 +32,28 @@ export type WorkspaceAdapter = {
   readonly publish: (from: string, to: string) => Promise<string>;
   /** Removes a staging directory and everything in it. Never throws. */
   readonly discard: (path: string) => Promise<void>;
+  /** Removes staging directories left over from an earlier run; returns how many. */
+  readonly sweepStaging: (root: string) => Promise<number>;
 };
 
 export type WorkspaceAdapterOptions = {
   readonly run?: CommandRunner;
   readonly commandTimeoutMs?: number;
   readonly logger?: Logger;
+  /** The wait between removal attempts. Injected so tests need no real clock. */
+  readonly sleep?: (ms: number) => Promise<void>;
 };
+
+/**
+ * Staging directories are named `.<workspace>.creating-<8 hex>`. The shape is worth
+ * pinning down rather than guessing at, because a sweep deletes what matches it and
+ * a dotted directory an operator put under the root must never be mistaken for one.
+ */
+const STAGING_PATTERN = /^\..+\.creating-[\da-f]{8}$/;
+
+/** How hard `discard` tries before it settles for saying so. */
+const DISCARD_ATTEMPTS = 3;
+const DISCARD_RETRY_MS = 20;
 
 /**
  * The commit is made with an identity given inline. A daemon started by launchd has
@@ -168,23 +184,85 @@ const publish = async (from: string, to: string): Promise<string> => {
   return realpath(to);
 };
 
-/**
- * Staging is ccrcd's own scratch directory under a name the scan skips, so unlike a
- * real workspace there is never a question of whether it is safe to delete: it was
- * never launchable and nothing else knows it exists.
- */
-const discard = async (path: string): Promise<void> => {
-  try {
-    await rm(path, { force: true, recursive: true });
-  } catch {
-    // Best effort. The staging name is unique and invisible to the scan, so the
-    // worst case is one stray directory rather than a workspace nobody meant.
-  }
-};
-
 export const createWorkspaceAdapter = (options: WorkspaceAdapterOptions = {}): WorkspaceAdapter => {
   const run = options.run ?? createBunCommandRunner(options.commandTimeoutMs);
   const logger = options.logger ?? createLogger();
+  const sleep = options.sleep ?? Bun.sleep;
+
+  /** Whether anything is still at that path, without ever throwing about it. */
+  const stillThere = async (path: string): Promise<boolean> => {
+    try {
+      await lstat(path);
+      return true;
+    } catch (cause) {
+      // Only "it is not there" counts as gone; anything else, assume it survived.
+      return errorCode(cause) !== 'ENOENT';
+    }
+  };
+
+  /**
+   * Staging is ccrcd's own scratch directory under a name the scan skips, so unlike
+   * a real workspace there is never a question of whether it is safe to delete: it
+   * was never launchable and nothing else knows it exists.
+   *
+   * The removal is checked rather than assumed. Under concurrent spawning `rm` has
+   * been seen to resolve with the directory still on disk, and a staging directory
+   * left behind is a `.git` repo nobody will ever look at again — so this looks, and
+   * tries again, and says so if the thing is still there. What it cannot clear, the
+   * next startup sweep will.
+   */
+  const discard = async (path: string): Promise<void> => {
+    const attempt = async (remaining: number): Promise<void> => {
+      try {
+        await rm(path, { force: true, recursive: true });
+      } catch {
+        // The check below is the judge of whether this mattered.
+      }
+      if (!(await stillThere(path))) {
+        return;
+      }
+      if (remaining <= 1) {
+        logger.error(
+          `ccrcd could not remove the staging directory ${path}; it will be swept the next time the daemon starts`,
+        );
+        return;
+      }
+      await sleep(DISCARD_RETRY_MS);
+      return attempt(remaining - 1);
+    };
+    return attempt(DISCARD_ATTEMPTS);
+  };
+
+  /**
+   * Removes staging directories a previous run left behind — a daemon killed
+   * mid-creation leaves one, and so does a removal that never took. Safe by
+   * construction: the names it matches are ones only ccrcd creates and the scan
+   * never offers, so nothing launchable is ever in scope.
+   */
+  const sweepStaging = async (root: string): Promise<number> => {
+    let entries;
+    try {
+      entries = await readdir(root, { withFileTypes: true });
+    } catch (cause) {
+      if (errorCode(cause) !== 'ENOENT') {
+        logger.error(
+          `ccrcd could not sweep the workspaces root (${errorCode(cause) ?? 'unknown error'})`,
+        );
+      }
+      return 0;
+    }
+    const stale = entries.filter(
+      (entry) => entry.isDirectory() && STAGING_PATTERN.test(entry.name),
+    );
+    const removed = await Promise.all(
+      stale.map(async (entry) => {
+        const path = join(root, entry.name);
+        await discard(path);
+        return await stillThere(path);
+      }),
+    );
+    return removed.filter((survived) => !survived).length;
+  };
 
   const initRepo = async (path: string): Promise<void> => {
     const initialised = await run(['git', '-C', path, 'init', '-q']);
@@ -213,5 +291,14 @@ export const createWorkspaceAdapter = (options: WorkspaceAdapterOptions = {}): W
     }
   };
 
-  return { createDirectory, discard, exists, initRepo, listDirectories, prepareRoot, publish };
+  return {
+    createDirectory,
+    discard,
+    exists,
+    initRepo,
+    listDirectories,
+    prepareRoot,
+    publish,
+    sweepStaging,
+  };
 };

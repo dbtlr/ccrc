@@ -54,6 +54,11 @@ const start = async (): Promise<void> => {
   // useful before that answers.
   startSupervisor({ intervalMs: config.supervision.intervalMs, logger, service });
 
+  // Whatever an interrupted creation left behind goes now, while nothing is running.
+  // Not awaited either, and it cannot throw: a stale staging directory is untidy, not
+  // a reason to hold up the daemon.
+  void workspaces.sweepStaging();
+
   const repoNames = config.repos.map((repo) => repo.name).join(', ') || 'none';
   const root = config.workspacesRoot ?? 'not configured';
   logger.info(

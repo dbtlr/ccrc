@@ -42,6 +42,8 @@ export type RepoRegistry = {
 
 export type WorkspaceService = {
   readonly create: (name: string) => Promise<WorkspaceSummary>;
+  /** Clears staging directories an earlier run left behind. Never throws. */
+  readonly sweepStaging: () => Promise<number>;
 };
 
 export type RegistryOptions = {
@@ -236,5 +238,29 @@ export const createWorkspaceService = (options: WorkspaceServiceOptions): Worksp
     }
   };
 
-  return { create };
+  /**
+   * Run once at startup. A daemon killed between `mkdir` and `rename` leaves a
+   * staging directory behind, and so does a removal that silently did not take;
+   * neither is launchable, so both are simply cleared before the daemon gets going.
+   */
+  const sweepStaging = async (): Promise<number> => {
+    const root = config.workspacesRoot;
+    if (root === null) {
+      return 0;
+    }
+    try {
+      const swept = await adapter.sweepStaging(root);
+      if (swept > 0) {
+        logger.info(`ccrcd swept ${swept} unfinished workspace directories from an earlier run`);
+      }
+      return swept;
+    } catch (cause) {
+      // Housekeeping never holds up a start, and never becomes an unhandled
+      // rejection in the caller that fired it and walked away.
+      logger.error(`ccrcd could not sweep unfinished workspace directories: ${messageOf(cause)}`);
+      return 0;
+    }
+  };
+
+  return { create, sweepStaging };
 };

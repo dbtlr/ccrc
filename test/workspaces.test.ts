@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdir, readdir, realpath, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, realpath, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { CommandResult, CommandRunner } from '../src/adapter/claude.ts';
@@ -186,6 +186,104 @@ describe('workspace scan', () => {
       // Any other name is indeterminate, not absent.
       const lookup = await rejection(registry.find('maybe'));
       expect(lookup).toBeInstanceOf(WorkspaceError);
+    });
+  });
+});
+
+describe('staging hygiene', () => {
+  test('checks that a discarded staging directory actually went, and retries', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      const staging = join(root, '.doomed.creating-abcd1234');
+      await mkdir(join(staging, '.git'), { recursive: true });
+      // A removal that does not remove: under load `rm` has been seen to resolve with
+      // the directory still on disk, and a read-only parent reproduces the shape of
+      // that — the call fails to take effect, and nothing notices.
+      await chmod(root, 0o500);
+      const log = capturingLogger();
+      const adapter = createWorkspaceAdapter({
+        logger: log.logger,
+        run: () => Promise.resolve(ok()),
+        // The wait between attempts is where the obstruction clears.
+        sleep: async () => {
+          await chmod(root, 0o700);
+        },
+      });
+
+      await adapter.discard(staging);
+
+      expect(await readdir(root)).toEqual([]);
+    });
+  });
+
+  test('reports a staging directory it could not remove at all', async () => {
+    await withTempDir(async (dir) => {
+      const root = join(dir, 'workspaces');
+      const staging = join(root, '.stuck.creating-abcd1234');
+      await mkdir(staging, { recursive: true });
+      await chmod(root, 0o500);
+      const log = capturingLogger();
+      const adapter = createWorkspaceAdapter({
+        logger: log.logger,
+        run: () => Promise.resolve(ok()),
+        sleep: () => Promise.resolve(),
+      });
+
+      try {
+        await adapter.discard(staging);
+
+        expect(log.errors.join('')).toMatch(/could not remove the staging directory/);
+      } finally {
+        await chmod(root, 0o700);
+      }
+    });
+  });
+
+  test('sweeps stale staging directories at startup and leaves everything else', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+      // What a crash mid-creation leaves behind, beside things that must not be touched.
+      await mkdir(join(harnessed.root, '.old.creating-abcd1234', '.git'), { recursive: true });
+      await mkdir(join(harnessed.root, '.newer.creating-00ff99aa'), { recursive: true });
+      await mkdir(join(harnessed.root, 'keeper'), { recursive: true });
+      await mkdir(join(harnessed.root, '.config'), { recursive: true });
+      await writeFile(join(harnessed.root, '.env'), 'SECRET=1\n');
+      const service = createWorkspaceService({
+        adapter: harnessed.adapter,
+        config: harnessed.config,
+        logger: harnessed.log.logger,
+      });
+
+      expect(await service.sweepStaging()).toBe(2);
+
+      expect((await readdir(harnessed.root)).toSorted()).toEqual(['.config', '.env', 'keeper']);
+      expect(harnessed.log.info.join('')).toMatch(/2 unfinished workspace/);
+    });
+  });
+
+  test('sweeps nothing, and says nothing, when there is no root or nothing stale', async () => {
+    await withTempDir(async (dir) => {
+      const withoutRoot = await harness(dir, {
+        configToml: '[[repos]]\nname = "example"\npath = "/repos/example"\n',
+      });
+      const harnessed = await harness(dir);
+      await mkdir(join(harnessed.root, 'keeper'), { recursive: true });
+
+      const unconfigured = createWorkspaceService({
+        adapter: withoutRoot.adapter,
+        config: withoutRoot.config,
+        logger: withoutRoot.log.logger,
+      });
+      const configured = createWorkspaceService({
+        adapter: harnessed.adapter,
+        config: harnessed.config,
+        logger: harnessed.log.logger,
+      });
+
+      expect(await unconfigured.sweepStaging()).toBe(0);
+      expect(await configured.sweepStaging()).toBe(0);
+      expect(harnessed.log.info).toEqual([]);
+      expect(await readdir(harnessed.root)).toEqual(['keeper']);
     });
   });
 });
