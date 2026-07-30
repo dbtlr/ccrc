@@ -18,6 +18,7 @@ const start = async (): Promise<void> => {
   const server = Bun.serve({
     fetch: createApp(service, {
       allowedOrigins: config.allowedOrigins,
+      port: config.port,
       uiDir: Bun.env.CCRC_UI_DIR ?? defaultUiDir(),
     }).fetch,
     hostname: config.bind,

@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 
+import { DEFAULT_PORT } from '../config.ts';
 import {
   BadRequestError,
   CcrcError,
@@ -21,8 +22,28 @@ const READ_METHODS = new Set(['GET', 'HEAD']);
  */
 const API_PREFIXES = ['/healthz', '/repos', '/sessions'];
 
-const isApiPath = (pathname: string): boolean =>
-  API_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+/**
+ * Compared case-insensitively and against the decoded path, because the fallback
+ * that consults this decodes too. Matching the raw path here while the static
+ * server decodes lets a request slip between the two normalisations: `/sessions%2f`
+ * is not an API path by a raw-prefix test, so it would be answered with the shell
+ * and a JSON client would parse HTML instead of handling a 404. An encoded slash
+ * or backslash never belongs in a path this API serves, so it is refused outright
+ * rather than decoded and guessed at.
+ */
+const isApiPath = (pathname: string): boolean => {
+  const candidate = pathname.toLowerCase();
+  if (/%2f|%5c/i.test(pathname)) {
+    return true;
+  }
+  let decoded = candidate;
+  try {
+    decoded = decodeURIComponent(candidate);
+  } catch {
+    return true;
+  }
+  return API_PREFIXES.some((prefix) => decoded === prefix || decoded.startsWith(`${prefix}/`));
+};
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -69,21 +90,76 @@ const requireJsonContentType = (request: Request): void => {
   }
 };
 
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
 /**
- * The daemon's own origin is always trusted; `allowedOrigins` adds the reverse
- * proxy the console is actually loaded from. Membership is exact string equality
- * against a validated set — a near-miss on scheme, port, or path is a stranger.
+ * The trusted origins are computed from configuration, never from the request.
+ * Deriving them from `request.url` would read them out of the `Host` header, which
+ * the caller controls: a page that forges `Host` and `Origin` to the same value
+ * would then be trusted, which is what DNS rebinding does — resolve an
+ * attacker-owned name to 127.0.0.1 and every browser-attached header describes a
+ * same-origin request to a host the operator never named.
+ */
+const trustedOriginsFor = (port: number, allowedOrigins: readonly string[]): ReadonlySet<string> =>
+  new Set([
+    `http://127.0.0.1:${port}`,
+    `http://localhost:${port}`,
+    `http://[::1]:${port}`,
+    ...allowedOrigins,
+  ]);
+
+/**
+ * The other half of the rebinding defence: the `Host` a request claims has to be
+ * one the operator named. Rebinding turns on the browser believing it is talking
+ * to the attacker's hostname, so refusing unknown hostnames breaks it regardless
+ * of what `Origin` says — which is why this applies to reads too, not just
+ * mutations. A rebound page can otherwise read the whole session list.
+ *
+ * Matching is on hostname alone. The port a proxy forwards to is a deployment
+ * detail, and no attacker gains anything by guessing it; the hostname is the part
+ * that has to be legitimate.
+ */
+const trustedHostnamesFor = (allowedOrigins: readonly string[]): ReadonlySet<string> =>
+  new Set([...LOOPBACK_HOSTNAMES, ...allowedOrigins.map((origin) => new URL(origin).hostname)]);
+
+/**
+ * Read from the request URL, which the server builds out of the `Host` header, so
+ * this sees exactly the host the caller claimed. That the value is
+ * caller-controlled is the point: it is compared against a set drawn from
+ * configuration, which is what makes rebinding fail. The rejection names the fix
+ * without quoting the header — an attacker-supplied `Host` echoed into a log line
+ * is a log-injection primitive.
+ */
+const requireTrustedHost = (request: Request, trustedHostnames: ReadonlySet<string>): void => {
+  let hostname: string;
+  try {
+    hostname = new URL(request.url).hostname.toLowerCase();
+  } catch {
+    throw new ForbiddenError('requests must carry a usable Host header');
+  }
+  if (trustedHostnames.has(hostname)) {
+    return;
+  }
+  throw new ForbiddenError(
+    'unrecognised Host. Reach ccrcd on a loopback address, or name the proxy host in "allowed_origins".',
+  );
+};
+
+/**
+ * `allowedOrigins` adds the reverse proxy the console is actually loaded from.
+ * Membership is exact string equality against a validated set — a near-miss on
+ * scheme, port, or path is a stranger.
  *
  * `Sec-Fetch-Site: cross-site` stays a flat refusal. A console served through the
  * proxy is same-origin from the browser's point of view, so that header never
  * describes a request the allow-list is meant to admit.
  */
-const requireTrustedOrigin = (request: Request, allowedOrigins: ReadonlySet<string>): void => {
+const requireTrustedOrigin = (request: Request, trustedOrigins: ReadonlySet<string>): void => {
   if (request.headers.get('sec-fetch-site') === 'cross-site') {
     throw new ForbiddenError('cross-site requests are refused');
   }
   const origin = request.headers.get('origin');
-  if (origin === null || origin === new URL(request.url).origin || allowedOrigins.has(origin)) {
+  if (origin === null || trustedOrigins.has(origin)) {
     return;
   }
   throw new ForbiddenError('cross-origin requests are refused');
@@ -92,6 +168,8 @@ const requireTrustedOrigin = (request: Request, allowedOrigins: ReadonlySet<stri
 export type AppOptions = {
   /** Exact origins, already validated by config loading. */
   readonly allowedOrigins?: readonly string[];
+  /** The configured listen port, which fixes the daemon's own trusted origins. */
+  readonly port?: number;
   /** Where the built console lives. Omitted, the app is the JSON API alone. */
   readonly uiDir?: string | undefined;
 };
@@ -99,7 +177,9 @@ export type AppOptions = {
 /** Wires the JSON API onto a session service. Nothing here knows about tmux. */
 export const createApp = (service: SessionService, options: AppOptions = {}): Hono => {
   const app = new Hono();
-  const allowedOrigins = new Set(options.allowedOrigins);
+  const allowedOrigins = options.allowedOrigins ?? [];
+  const trustedOrigins = trustedOriginsFor(options.port ?? DEFAULT_PORT, allowedOrigins);
+  const trustedHostnames = trustedHostnamesFor(allowedOrigins);
   const ui = options.uiDir === undefined ? undefined : createUiServer(options.uiDir);
 
   // Response.json rather than context.json: the numeric status carried by the
@@ -116,8 +196,9 @@ export const createApp = (service: SessionService, options: AppOptions = {}): Ho
 
   app.use('*', async (context, next) => {
     const { method } = context.req;
+    requireTrustedHost(context.req.raw, trustedHostnames);
     if (MUTATING_METHODS.has(method)) {
-      requireTrustedOrigin(context.req.raw, allowedOrigins);
+      requireTrustedOrigin(context.req.raw, trustedOrigins);
       if (BODY_METHODS.has(method)) {
         requireJsonContentType(context.req.raw);
       }

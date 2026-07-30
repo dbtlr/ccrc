@@ -51,7 +51,7 @@ const harness = async (dir: string, configToml: string = CONFIG_TOML): Promise<H
   });
   return {
     adapter,
-    app: createApp(service, { allowedOrigins: config.allowedOrigins }),
+    app: createApp(service, { allowedOrigins: config.allowedOrigins, port: config.port }),
     config,
     statePath,
   };
@@ -646,15 +646,94 @@ describe('cross-origin defence', () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir);
 
+      // The daemon's own origin carries the configured port. `http://localhost`
+      // without one is a different origin, and is only trusted if something is
+      // reading trust out of the request rather than out of the config.
       const sameOrigin = await bodyOnly(harnessed, {
         'content-type': 'application/json',
-        origin: 'http://localhost',
+        origin: `http://localhost:${harnessed.config.port}`,
         'sec-fetch-site': 'same-origin',
       });
       expect(sameOrigin.status).toBe(201);
 
       const deleted = await harnessed.app.request('/sessions/id1', { method: 'DELETE' });
       expect(deleted.status).toBe(200);
+    });
+  });
+
+  test('a forged Host that matches a forged Origin is still refused', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      // DNS rebinding: the attacker's own hostname resolves to 127.0.0.1, so the
+      // browser sends Host and Origin that agree with each other and describe a
+      // same-origin request. Trust read out of the request would accept this.
+      const rebound = await harnessed.app.request('http://evil.example/sessions', {
+        body: JSON.stringify({ repo: 'example' }),
+        headers: {
+          'content-type': 'application/json',
+          origin: 'http://evil.example',
+          'sec-fetch-site': 'same-origin',
+        },
+        method: 'POST',
+      });
+
+      expect(rebound.status).toBe(403);
+      expect(harnessed.adapter.launches).toHaveLength(0);
+    });
+  });
+
+  test('a loopback Host on the wrong port cannot vouch for its own Origin', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      // The host check passes here — the hostname is loopback — so this isolates
+      // the origin half: trust taken from the request would compare Origin against
+      // this same forged authority and match it. Only the configured port is ours.
+      const wrongPort = await harnessed.app.request('http://127.0.0.1:9999/sessions', {
+        body: JSON.stringify({ repo: 'example' }),
+        headers: {
+          'content-type': 'application/json',
+          origin: 'http://127.0.0.1:9999',
+          'sec-fetch-site': 'same-origin',
+        },
+        method: 'POST',
+      });
+
+      expect(wrongPort.status).toBe(403);
+      expect(harnessed.adapter.launches).toHaveLength(0);
+    });
+  });
+
+  test('an unrecognised Host is refused on reads as well', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      // A rebound page can read as easily as it can write, so the host check
+      // cannot be limited to mutations.
+      const listed = await harnessed.app.request('http://evil.example/sessions');
+      expect(listed.status).toBe(403);
+
+      const repos = await harnessed.app.request('http://evil.example/repos');
+      expect(repos.status).toBe(403);
+    });
+  });
+
+  test('the configured proxy host is reachable as a Host and as an Origin', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir);
+
+      const proxied = await harnessed.app.request('https://ccrc.example/sessions', {
+        body: JSON.stringify({ repo: 'example' }),
+        headers: {
+          'content-type': 'application/json',
+          origin: 'https://ccrc.example',
+          'sec-fetch-site': 'same-origin',
+        },
+        method: 'POST',
+      });
+
+      expect(proxied.status).toBe(201);
     });
   });
 

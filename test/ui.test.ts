@@ -164,6 +164,20 @@ describe('serving the console', () => {
     });
   });
 
+  test.each(['/sessions%2f', '/sessions%2Fabc', '/healthz%2fx', '/SESSIONS', '/Sessions/abc'])(
+    'the API path %s stays a JSON failure rather than becoming a page',
+    async (path) => {
+      await withTempDir(async (dir) => {
+        const { app } = await withBuiltUi(dir, 'present');
+
+        const response = await app.request(path);
+
+        expect(response.status).toBe(404);
+        expect(response.headers.get('content-type')).toContain('application/json');
+      });
+    },
+  );
+
   test('the API alone is served when no build directory is configured', async () => {
     await withTempDir(async (dir) => {
       const configPath = join(dir, 'config.toml');
