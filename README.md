@@ -138,6 +138,11 @@ bun run dev            # the daemon
 bun run dev:ui         # the console, on Vite's port
 ```
 
+`CCRC_UI_DIR` overrides where the built console is read from, for a build placed somewhere
+other than `ui/dist`. It is trusted as given: whatever directory it names is served, so
+pointing it at anything other than a `ui/dist`-shaped build turns the daemon into a
+loopback-reachable read-only file server over that directory instead.
+
 ## API
 
 All responses are JSON. Errors are `{ "error": "..." }` with a 4xx/5xx status.
