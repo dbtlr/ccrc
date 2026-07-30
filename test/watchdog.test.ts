@@ -328,6 +328,40 @@ describe('reboot reconciliation', () => {
     });
   });
 
+  test('bounds the claim of a record written before ccrcd tracked end times', async () => {
+    await withTempDir(async (dir) => {
+      const harnessed = await harness(dir, [
+        // A record from an older state file: terminal, but with no endedAt to bound
+        // its claim. Its own start is the latest moment it could have been holding
+        // anything.
+        sessionRecord({
+          endedAt: null,
+          hostSessionId: 'sid-old',
+          id: 'id1',
+          pid: 4242,
+          startedAt: NOW - 4 * DAY,
+          status: 'stopped',
+          tmuxName: 'ccrc-example-1',
+        }),
+        sessionRecord({ id: 'id2', pid: null, status: 'running', tmuxName: 'ccrc-example-2' }),
+      ]);
+      harnessed.adapter.liveNames = ['ccrc-example-2'];
+      harnessed.adapter.hostSessions = [
+        hostSession({
+          cwd: '/repos/example',
+          pid: 4242,
+          sessionId: 'sid-new',
+          startedAt: NOW,
+          status: 'idle',
+        }),
+      ];
+
+      const listing = await harnessed.service.reconcile();
+
+      expect(listing.sessions.find((session) => session.id === 'id2')?.activity).toBe('idle');
+    });
+  });
+
   test('leaves records alone when tmux cannot say what is live', async () => {
     await withTempDir(async (dir) => {
       const harnessed = await harness(dir, [sessionRecord({ id: 'id1', status: 'running' })]);

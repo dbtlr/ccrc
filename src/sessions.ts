@@ -167,10 +167,14 @@ const startedTogether = (session: HostSession, record: SessionRecord): boolean =
  * A dead record's claim expires with the session, though. The OS reuses pids, and a
  * record kept for the retention window would otherwise make a legitimate new session
  * uncorrelatable for days — no activity of its own, and no hang coverage. So a record
- * that has ended only claims entries that existed before it did: an entry that
- * started afterwards cannot be the session it was holding. An entry that will not say
- * when it started stays claimed, because the alternative guesses in the dangerous
- * direction.
+ * that has ended only claims entries that existed before it did: an entry that started
+ * afterwards cannot be the session it was holding. Records written before ccrcd tracked
+ * end times have no `endedAt`, so their own start bounds them instead — the latest
+ * moment they could have been holding anything.
+ *
+ * Two things stay claimed unconditionally: a record that is still active, whose entry
+ * is its own by definition, and an entry that will not say when it started, because the
+ * alternative guesses in the dangerous direction.
  */
 const isClaimed = (session: HostSession, others: readonly SessionRecord[]): boolean =>
   others.some((other) => {
@@ -180,9 +184,10 @@ const isClaimed = (session: HostSession, others: readonly SessionRecord[]): bool
     if (!mine) {
       return false;
     }
-    return other.endedAt === null || session.startedAt === null
-      ? true
-      : session.startedAt <= other.endedAt;
+    if (!TERMINAL_STATUSES.has(other.status) || session.startedAt === null) {
+      return true;
+    }
+    return session.startedAt <= (other.endedAt ?? other.startedAt);
   });
 
 const correlate = (
