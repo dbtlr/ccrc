@@ -84,7 +84,7 @@ export const SessionStrip = ({
           </p>
         </div>
 
-        {confirming ? (
+        {confirming && live ? (
           <div className="mt-3.5 space-y-2.5">
             <p className="text-data text-muted">
               Stopping kills the tmux session. Anything unsaved in it is lost.

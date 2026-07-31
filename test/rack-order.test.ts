@@ -96,6 +96,34 @@ describe('partitionSessions', () => {
     expect(closed.map((s) => s.id)).toEqual(['newest', 'middle', 'older']);
   });
 
+  test('a mixed rack sorts each side independently', () => {
+    const busy = session({ activity: 'busy', id: 'busy', startedAt: 1_000 });
+    const idle = session({ activity: 'idle', id: 'idle', startedAt: 2_000 });
+    const early = session({ endedAt: 1_000, id: 'early', status: 'stopped' });
+    const late = session({ endedAt: 2_000, id: 'late', status: 'failed' });
+
+    // Closed strips interleave the active ones, and each side arrives in the
+    // opposite of its expected order.
+    const { active, closed } = partitionSessions([idle, early, busy, late]);
+
+    expect(active.map((s) => s.id)).toEqual(['busy', 'idle']);
+    expect(closed.map((s) => s.id)).toEqual(['late', 'early']);
+  });
+
+  test('the input array is left untouched', () => {
+    const input = [
+      session({ endedAt: 1_000, id: 'stopped', status: 'stopped' }),
+      session({ activity: 'busy', id: 'busy' }),
+      session({ activity: 'idle', id: 'idle' }),
+    ];
+
+    // The rack partitions the polled query data in place on every render; sorting
+    // the shared array itself would reorder it under every other reader.
+    partitionSessions(input);
+
+    expect(input.map((s) => s.id)).toEqual(['stopped', 'busy', 'idle']);
+  });
+
   test('a closed session with no endedAt falls back to startedAt', () => {
     const ended = session({ endedAt: 2_000, id: 'ended', startedAt: 100, status: 'stopped' });
     const neverEnded = session({
