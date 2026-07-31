@@ -69,6 +69,8 @@ export const SessionRack = ({ onStop, stoppingId }: SessionRackProps): JSX.Eleme
       {active.length === 0 ? null : <ul className="rack space-y-2.5">{strips(active)}</ul>}
       {closed.length === 0 ? null : (
         <Button
+          aria-controls="closed-sessions"
+          aria-expanded={showClosed}
           className="mt-2.5 font-mono text-micro text-faint uppercase"
           onClick={toggleClosed}
           variant="ghost"
@@ -77,7 +79,9 @@ export const SessionRack = ({ onStop, stoppingId }: SessionRackProps): JSX.Eleme
         </Button>
       )}
       {showClosed && closed.length > 0 ? (
-        <ul className="rack mt-2.5 space-y-2.5">{strips(closed)}</ul>
+        <ul className="rack mt-2.5 space-y-2.5" id="closed-sessions">
+          {strips(closed)}
+        </ul>
       ) : null}
     </section>
   );

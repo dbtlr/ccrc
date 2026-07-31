@@ -111,10 +111,12 @@ describe('partitionSessions', () => {
   });
 
   test('the input array is left untouched', () => {
+    // Distinct timestamps throughout, so an in-place sort by either comparator
+    // would visibly reorder the input rather than hiding behind equal keys.
     const input = [
-      session({ endedAt: 1_000, id: 'stopped', status: 'stopped' }),
-      session({ activity: 'busy', id: 'busy' }),
-      session({ activity: 'idle', id: 'idle' }),
+      session({ endedAt: 4_000, id: 'stopped', startedAt: 1_000, status: 'stopped' }),
+      session({ activity: 'busy', id: 'busy', startedAt: 2_000 }),
+      session({ activity: 'idle', id: 'idle', startedAt: 3_000 }),
     ];
 
     // The rack partitions the polled query data in place on every render; sorting
