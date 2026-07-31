@@ -100,7 +100,7 @@ export const SessionStrip = ({
           </div>
         ) : null}
 
-        {confirming || !(session.attachUrl !== null || live) ? null : (
+        {confirming || !live ? null : (
           <div className="mt-3.5 flex items-center gap-2">
             {session.attachUrl === null ? null : (
               <Button asChild className="flex-1" variant="outline">
@@ -120,11 +120,9 @@ export const SessionStrip = ({
                 </a>
               </Button>
             )}
-            {live ? (
-              <Button className="ml-auto" disabled={stopping} onClick={askToStop} variant="ghost">
-                {stopping ? 'Stopping…' : 'Stop'}
-              </Button>
-            ) : null}
+            <Button className="ml-auto" disabled={stopping} onClick={askToStop} variant="ghost">
+              {stopping ? 'Stopping…' : 'Stop'}
+            </Button>
           </div>
         )}
       </div>

@@ -15,6 +15,7 @@ export type Session = {
   readonly attachUrl: string | null;
   readonly pid: number | null;
   readonly startedAt: number;
+  readonly endedAt: number | null;
   readonly status: SessionStatus;
   readonly activity: SessionActivity;
 };
@@ -69,6 +70,7 @@ const toSession = (value: unknown): Session | null => {
   return {
     activity: asActivity(value.activity),
     attachUrl: asAttachUrl(value.attachUrl),
+    endedAt: asNumber(value.endedAt),
     host: asString(value.host, 'this host'),
     id: value.id,
     name: asString(value.name, value.id),
