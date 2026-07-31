@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
-import type { HangOutcome, SessionListing, SessionService } from '../src/sessions.ts';
+import type { HostSession } from '../src/adapter/claude.ts';
+import type { HangOutcome, IdleOutcome, SessionListing, SessionService } from '../src/sessions.ts';
 import { startSupervisor } from '../src/supervise.ts';
 import type { Ticker } from '../src/supervise.ts';
 import { capturingLogger } from './support.ts';
@@ -16,7 +17,9 @@ type Stub = {
   /** Every phase the supervisor ran, in order. */
   readonly phases: string[];
   reconcile: () => Promise<SessionListing>;
+  readFleet: () => Promise<readonly HostSession[]>;
   sweep: () => Promise<readonly HangOutcome[]>;
+  sweepIdle: () => Promise<readonly IdleOutcome[]>;
   prune: () => Promise<number>;
 };
 
@@ -25,6 +28,7 @@ const stubService = (): Stub => {
   const stub: Stub = {
     phases,
     prune: () => Promise.resolve(0),
+    readFleet: () => Promise.resolve([]),
     reconcile: () => Promise.resolve(EMPTY_LISTING),
     service: {
       get: unused,
@@ -35,6 +39,10 @@ const stubService = (): Stub => {
         phases.push('prune');
         return stub.prune();
       },
+      readFleet: () => {
+        phases.push('fleet');
+        return stub.readFleet();
+      },
       reconcile: () => {
         phases.push('reconcile');
         return stub.reconcile();
@@ -44,8 +52,13 @@ const stubService = (): Stub => {
         phases.push('sweep');
         return stub.sweep();
       },
+      sweepIdle: () => {
+        phases.push('idle');
+        return stub.sweepIdle();
+      },
     },
     sweep: () => Promise.resolve([]),
+    sweepIdle: () => Promise.resolve([]),
   };
   return stub;
 };
@@ -88,7 +101,7 @@ describe('supervision loop', () => {
     });
     await supervisor.started;
 
-    expect(stub.phases).toEqual(['reconcile', 'sweep', 'prune']);
+    expect(stub.phases).toEqual(['reconcile', 'fleet', 'sweep', 'idle', 'prune']);
     expect(ticker.intervals).toEqual([30_000]);
     supervisor.stop();
     expect(ticker.cancels()).toBe(1);
@@ -140,7 +153,7 @@ describe('supervision loop', () => {
 
     blocked.resolve(EMPTY_LISTING);
     await supervisor.started;
-    expect(stub.phases).toEqual(['reconcile', 'sweep', 'prune']);
+    expect(stub.phases).toEqual(['reconcile', 'fleet', 'sweep', 'idle', 'prune']);
     supervisor.stop();
   });
 
@@ -192,6 +205,7 @@ describe('supervision loop', () => {
     const ticker = fakeTicker();
     stub.reconcile = () => Promise.reject(new Error('tmux is wedged'));
     stub.sweep = () => Promise.reject(new Error('the CLI is gone'));
+    stub.sweepIdle = () => Promise.reject(new Error('the fleet would not list'));
     const log = capturingLogger();
 
     const supervisor = startSupervisor({
@@ -202,13 +216,14 @@ describe('supervision loop', () => {
     });
     await supervisor.started;
 
-    expect(stub.phases).toEqual(['reconcile', 'sweep', 'prune']);
+    expect(stub.phases).toEqual(['reconcile', 'fleet', 'sweep', 'idle', 'prune']);
     expect(log.errors.join('')).toMatch(/could not reconcile records against tmux: tmux is wedged/);
     expect(log.errors.join('')).toMatch(/could not check for hung sessions: the CLI is gone/);
+    expect(log.errors.join('')).toMatch(/could not stop idle sessions: the fleet would not list/);
 
     // The loop is still live: the next tick runs every phase again.
     await supervisor.tick();
-    expect(stub.phases).toHaveLength(6);
+    expect(stub.phases).toHaveLength(10);
     supervisor.stop();
   });
 
@@ -234,7 +249,7 @@ describe('supervision loop', () => {
     );
     // The tick completed, so the next one is not treated as an overlap.
     await supervisor.tick();
-    expect(stub.phases).toHaveLength(6);
+    expect(stub.phases).toHaveLength(10);
     supervisor.stop();
   });
 

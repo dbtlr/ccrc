@@ -54,6 +54,12 @@ export type HangOutcome = {
   readonly restartedAs: string | null;
 };
 
+/** What the idle timeout did about one session. */
+export type IdleOutcome = {
+  readonly id: string;
+  readonly reason: string;
+};
+
 export type SessionService = {
   readonly listRepos: () => Promise<RepoListing>;
   readonly launch: (input: LaunchInput) => Promise<SessionView>;
@@ -62,8 +68,17 @@ export type SessionService = {
   readonly stop: (id: string) => Promise<SessionView>;
   /** Bring records back in line with tmux. Reads do this; so does the supervisor. */
   readonly reconcile: () => Promise<SessionListing>;
+  /**
+   * One reading of the host fleet, for a caller that is about to run both sweeps
+   * against it. They have to judge the same instant: a session that finishes a turn
+   * between two listings is busy in one and idle in the next, and an idle sweep
+   * holding the later listing would bill the whole busy stretch as idleness.
+   */
+  readonly readFleet: () => Promise<readonly HostSession[]>;
   /** Retire sessions that claim to be working but have stopped writing anything. */
-  readonly sweepHung: () => Promise<readonly HangOutcome[]>;
+  readonly sweepHung: (fleet: readonly HostSession[]) => Promise<readonly HangOutcome[]>;
+  /** Stop sessions that have sat idle past the configured timeout. */
+  readonly sweepIdle: (fleet: readonly HostSession[]) => Promise<readonly IdleOutcome[]>;
   /** Drop terminal records past the retention window; returns how many went. */
   readonly prune: () => Promise<number>;
 };
@@ -695,7 +710,16 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { ...withoutRepoPath(stopped), activity: 'unknown' };
   };
 
-  /** Retires a record ccrcd decided to end, with the reason it decided that. */
+  /**
+   * Retires a record ccrcd decided to end, with the reason it decided that.
+   *
+   * A record something else already ended keeps that account. An operator's `DELETE`
+   * landing mid-sweep is the truth about how the session ended, and a sweep finishing
+   * a moment later must not rewrite the attribution to its own — the same rule a
+   * settling launch follows when it finds the record already terminal. ccrcd's own
+   * retirements carry a reason, so a restart rewriting its record once the
+   * replacement is known is not "something else" and still goes through.
+   */
   const retire = (
     id: string,
     reason: string,
@@ -706,6 +730,19 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       const current = records.find((record) => record.id === id);
       if (current === undefined) {
         return { records, result: undefined };
+      }
+      if (TERMINAL_STATUSES.has(current.status) && current.stopReason === null) {
+        // Something else ended this record and owns the account of why. The restart
+        // cross-link is not attribution, though: without it the replacement would
+        // point back at a record that never says where the session went.
+        if (restartedAs === null || current.restartedAs === restartedAs) {
+          return { records, result: undefined };
+        }
+        const linked: SessionRecord = { ...current, restartedAs };
+        return {
+          records: records.map((record) => (record.id === id ? linked : record)),
+          result: undefined,
+        };
       }
       const next: SessionRecord = {
         ...current,
@@ -721,18 +758,27 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     });
 
   /**
-   * How stale a busy session's transcript is, or `null` when it is not hung.
+   * How long a session's transcript has stood still, or `null` when this is not a
+   * session to act on.
    *
-   * Two signals have to agree before a session is killed: the session says it is
-   * `busy`, and the transcript it would be appending to has not moved for the
-   * threshold. Everything else — an idle session, a session with no status of its
-   * own, one that could not be correlated, one with no session id, a transcript
-   * that cannot be read — is unknown, and unknown never trips the watchdog. Killing
-   * a working session because ccrcd could not see its transcript would destroy work
-   * nobody asked it to touch.
+   * Two signals have to agree before ccrcd touches a session: the session reports the
+   * activity being looked for, and the transcript it would be appending to has not
+   * moved for the threshold. Everything else — the other activity, a session with no
+   * status of its own, one that could not be correlated, one with no session id, a
+   * transcript that cannot be read or is not there, one that moved recently — is
+   * unknown, and unknown never trips anything. Acting on a working session because
+   * ccrcd could not see its transcript would destroy work nobody asked it to touch.
+   *
+   * Both sweeps come through here, so the discipline is written once: the hang
+   * watchdog asks about `busy`, the idle timeout about `idle`.
    */
-  const staleFor = async (record: SessionRecord, session: HostSession): Promise<number | null> => {
-    if (session.status !== 'busy' || session.sessionId === null) {
+  const staleFor = async (
+    record: SessionRecord,
+    session: HostSession,
+    activity: SessionActivity,
+    thresholdMs: number,
+  ): Promise<number | null> => {
+    if (session.status !== activity || session.sessionId === null) {
       return null;
     }
     let mtime: number | null;
@@ -750,8 +796,8 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     if (mtime === null) {
       return null;
     }
-    const idleFor = now() - mtime;
-    return idleFor >= config.supervision.hangThresholdMs ? idleFor : null;
+    const stillFor = now() - mtime;
+    return stillFor >= thresholdMs ? stillFor : null;
   };
 
   /**
@@ -871,20 +917,29 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
     return { id: record.id, reason, restartedAs: replacement };
   };
 
-  const sweepHung = async (): Promise<readonly HangOutcome[]> => {
+  const readFleet = (): Promise<readonly HostSession[]> => adapter.listHostSessions();
+
+  /**
+   * The fleet is handed in rather than read here, so this and the idle sweep judge
+   * the same instant. Records are re-loaded, though: the watchdog runs first and its
+   * retirements have to be visible, or a session it just retired would be swept
+   * again by the idle pass.
+   */
+  const sweepHung = async (
+    hostSessions: readonly HostSession[],
+  ): Promise<readonly HangOutcome[]> => {
     const records = await store.load();
     const running = records.filter((record) => record.status === 'running');
     if (running.length === 0) {
       return [];
     }
-    const hostSessions = await adapter.listHostSessions();
     const checked = await Promise.all(
       running.map(async (record) => {
         const session = correlate(record, hostSessions, records);
         if (session === undefined) {
           return null;
         }
-        const idleFor = await staleFor(record, session);
+        const idleFor = await staleFor(record, session, 'busy', config.supervision.hangThresholdMs);
         return idleFor === null ? null : { idleFor, record, session };
       }),
     );
@@ -894,6 +949,73 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
       checked
         .filter((entry) => entry !== null)
         .map((entry) => restartHung(entry.record, entry.session, entry.idleFor)),
+    );
+    return outcomes.filter((outcome) => outcome !== null);
+  };
+
+  /**
+   * Stops a session that has been sitting idle longer than the operator wants to pay
+   * for. Deliberately the same ending an operator's `DELETE` gives it — the kill, the
+   * claim on the host entry, one end time — with the reason ccrcd had for deciding.
+   *
+   * A kill tmux refuses leaves the record alone, exactly as it does for a hang: a
+   * session that is still running must never be recorded as stopped.
+   */
+  const stopIdle = async (
+    record: SessionRecord,
+    session: HostSession,
+    idleFor: number,
+  ): Promise<IdleOutcome | null> => {
+    // What was measured is the transcript standing still, so that is what the record
+    // says: "idle for N minutes" would claim to know the session was doing nothing,
+    // and the two signals together only establish that nothing was written.
+    const reason = `no activity for ${minutesOf(idleFor)} minutes; stopped by the idle timeout`;
+    try {
+      await adapter.stopSession(record.tmuxName);
+    } catch (cause) {
+      logger.error(
+        `ccrcd found session ${record.id} idle past the timeout but tmux refused to kill it, so the record was left active: ${messageOf(cause)}`,
+      );
+      return null;
+    }
+    await retire(record.id, reason, null, session);
+    logger.info(`ccrcd stopped session ${record.id} in repo ${record.repoName}: ${reason}`);
+    return { id: record.id, reason };
+  };
+
+  /**
+   * Unset means off, and off means no work: no records read, no transcripts probed,
+   * nothing stopped. The fleet comes from the same reading the hang watchdog judged,
+   * so a session that was busy a moment ago cannot be billed for that time as
+   * idleness — and records are re-loaded here, so anything the watchdog just retired
+   * is no longer `running` and is left alone.
+   */
+  const sweepIdle = async (
+    hostSessions: readonly HostSession[],
+  ): Promise<readonly IdleOutcome[]> => {
+    const { idleTimeoutMs } = config.supervision;
+    if (idleTimeoutMs === null) {
+      return [];
+    }
+    const records = await store.load();
+    const running = records.filter((record) => record.status === 'running');
+    if (running.length === 0) {
+      return [];
+    }
+    const checked = await Promise.all(
+      running.map(async (record) => {
+        const session = correlate(record, hostSessions, records);
+        if (session === undefined) {
+          return null;
+        }
+        const idleFor = await staleFor(record, session, 'idle', idleTimeoutMs);
+        return idleFor === null ? null : { idleFor, record, session };
+      }),
+    );
+    const outcomes = await Promise.all(
+      checked
+        .filter((entry) => entry !== null)
+        .map((entry) => stopIdle(entry.record, entry.session, entry.idleFor)),
     );
     return outcomes.filter((outcome) => outcome !== null);
   };
@@ -916,5 +1038,16 @@ export const createSessionService = (options: SessionServiceOptions): SessionSer
         : { records: kept, result: records.length - kept.length };
     });
 
-  return { get, launch, list, listRepos, prune, reconcile, stop, sweepHung };
+  return {
+    get,
+    launch,
+    list,
+    listRepos,
+    prune,
+    readFleet,
+    reconcile,
+    stop,
+    sweepHung,
+    sweepIdle,
+  };
 };

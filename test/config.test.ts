@@ -278,6 +278,7 @@ stopped_retention_days = 2
 
       expect(config.supervision).toEqual({
         hangThresholdMs: 120_000,
+        idleTimeoutMs: null,
         intervalMs: 5_000,
         restartCap: 1,
         restartCapWindowMs: 900_000,
@@ -294,6 +295,40 @@ stopped_retention_days = 2
         ...DEFAULT_SUPERVISION,
         hangThresholdMs: 1_200_000,
       });
+    });
+  });
+
+  test('leaves the idle timeout off unless it is asked for', async () => {
+    await withConfig(SAMPLE, async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.supervision.idleTimeoutMs).toBeNull();
+    });
+  });
+
+  test('reads the idle timeout in minutes when it is', async () => {
+    await withConfig('[supervision]\nidle_timeout_minutes = 45\n', async (configPath) => {
+      const config = await loadConfig({ CCRC_CONFIG: configPath }, '/home/tester');
+
+      expect(config.supervision.idleTimeoutMs).toBe(2_700_000);
+      // Nothing else about the table changes because this key is present.
+      expect(config.supervision.hangThresholdMs).toBe(DEFAULT_SUPERVISION.hangThresholdMs);
+    });
+  });
+
+  test.each([
+    'idle_timeout_minutes = 4',
+    'idle_timeout_minutes = 0',
+    'idle_timeout_minutes = -30',
+    'idle_timeout_minutes = 10081',
+    'idle_timeout_minutes = 30.5',
+    'idle_timeout_minutes = "30"',
+  ])('refuses the unusable %s', async (entry) => {
+    await withConfig(`[supervision]\n${entry}\n`, async (configPath) => {
+      const failure = await rejection(loadConfig({ CCRC_CONFIG: configPath }, '/home/tester'));
+
+      expect(failure).toBeInstanceOf(ConfigError);
+      expect(failure.message).toContain('idle_timeout_minutes');
     });
   });
 

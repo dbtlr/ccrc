@@ -133,6 +133,7 @@ hang_threshold_minutes = 10       # busy + transcript this stale = hung
 restart_cap = 3                   # automatic restarts per lineage per window (0 = never)
 restart_cap_window_minutes = 60
 stopped_retention_days = 7        # how long stopped/failed records are kept
+idle_timeout_minutes = 60         # optional, off unless set: idle + this stale = stopped
 ```
 
 Every duration is a whole number of its own unit inside a range that keeps the loop sane,
@@ -145,6 +146,11 @@ rather than a setting that silently misbehaves.
 | `hang_threshold_minutes`     | 1–1440                                                                                                                                        | A fraction of a minute would call every busy session hung on the next tick.                                                |
 | `restart_cap_window_minutes` | 1–10080, and at least `hang_threshold_minutes`                                                                                                | A window shorter than the threshold could never hold two restarts of one session.                                          |
 | `stopped_retention_days`     | 1–365, and at least `restart_cap_window_minutes` expressed in days (`ceil(minutes / 1440)`, so the default 60-minute window needs just 1 day) | Restart history lives on records; retention that expires inside the window would drop the history the cap is counted from. |
+| `idle_timeout_minutes`       | 5–10080, and absent by default — leave it out and nothing is ever stopped for being idle                                                      | Below a few minutes a pause to read something would end the session; a week is as long as "idle" means anything.           |
+
+The off switch for the idle timeout is leaving the key out, not setting it to `0` — unlike
+`restart_cap`, where `0` is a meaningful setting, `idle_timeout_minutes = 0` is outside the
+range and fails startup.
 
 ### Behind a reverse proxy
 
@@ -220,7 +226,7 @@ through the API.
 ## Supervision
 
 Reconciliation used to happen only when a client read the API. A loop inside the daemon now
-runs every `reconcile_interval_seconds`, plus once at startup, and does three things:
+runs every `reconcile_interval_seconds`, plus once at startup, and does four things:
 
 1. **Reconcile.** Records whose tmux session is gone are marked `stopped`. That is also the
    whole of the reboot story: a rebooted host has an empty tmux server, so the startup tick
@@ -248,7 +254,16 @@ runs every `reconcile_interval_seconds`, plus once at startup, and does three th
    tmux names are never reused, so the replacement is a new record: it carries
    `restartedFrom`, the retired one carries `restartedAs`. The replacement starts with no
    prompt; the original first message is not stored and is not replayed.
-3. **Prune.** `stopped` and `failed` records older than `stopped_retention_days` are dropped,
+3. **Stop idle sessions.** Off unless `idle_timeout_minutes` is set. The same two-signal
+   rule as the watchdog, with the signals the other way round: the session reports itself
+   `idle` **and** its transcript has not moved for the timeout. Anything indeterminate — a
+   busy session, one that reports no status, one that cannot be correlated, a transcript
+   that cannot be read — is left alone, and a session is never stopped on the strength of
+   one signal. What happens then is an ordinary stop: the tmux session is killed and the
+   record goes `stopped`, with a `stopReason` naming how long nothing was written. Nothing is
+   restarted — an idle stop is meant to be the end of it — and it has no bearing on the
+   restart cap.
+4. **Prune.** `stopped` and `failed` records older than `stopped_retention_days` are dropped,
    measured from when the record ended rather than when it started.
 
 At most `restart_cap` automatic restarts happen per restart lineage within
