@@ -15,7 +15,7 @@ type Served = {
   readonly uiDir: string;
 };
 
-/** A stand-in for `ui/dist`: a shell, one hashed asset, and nothing else. */
+/** A stand-in for `ui/dist`: a shell, a favicon, one hashed asset, and nothing else. */
 const withBuiltUi = async (dir: string, build: 'present' | 'absent'): Promise<Served> => {
   const configPath = join(dir, 'config.toml');
   await Bun.write(
@@ -26,6 +26,7 @@ const withBuiltUi = async (dir: string, build: 'present' | 'absent'): Promise<Se
   const uiDir = join(dir, 'dist');
   if (build === 'present') {
     await Bun.write(join(uiDir, 'index.html'), SHELL);
+    await Bun.write(join(uiDir, 'favicon.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
     await Bun.write(join(uiDir, 'assets', 'index-abc123.js'), 'export const board = 1;\n');
     await Bun.write(join(uiDir, 'assets', 'index-abc123.css'), ':root { color: red }\n');
   }
@@ -63,6 +64,20 @@ describe('serving the console', () => {
 
       const styles = await app.request('/assets/index-abc123.css');
       expect(styles.headers.get('content-type')).toContain('text/css');
+    });
+  });
+
+  // The favicon lives at the build root without a content hash, so it must ride the
+  // shell's no-cache policy rather than the year-long cache meant for hashed assets.
+  test('serves the favicon from the build root without the immutable asset cache', async () => {
+    await withTempDir(async (dir) => {
+      const { app } = await withBuiltUi(dir, 'present');
+
+      const icon = await app.request('/favicon.svg');
+
+      expect(icon.status).toBe(200);
+      expect(icon.headers.get('content-type')).toContain('svg');
+      expect(icon.headers.get('cache-control')).toBe('no-cache');
     });
   });
 
